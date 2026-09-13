@@ -1152,6 +1152,7 @@ async def character_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         InlineKeyboardButton("💎 Rarity", callback_data="charstats:rarity"),
         InlineKeyboardButton("🧑 Character", callback_data="charstats:character"),
         InlineKeyboardButton("🎬 Serie", callback_data="charstats:series"),
+        InlineKeyboardButton("🎉 Event", callback_data="charstats:event"),
     ]])
     await update.message.reply_text(
         f"🗂 <b>{total}</b> card(s) total in the bot.\nPick a breakdown:",
@@ -1174,9 +1175,12 @@ async def character_stats_callback(update: Update, context: ContextTypes.DEFAULT
     elif kind == "character":
         rows = db.get_card_counts_by_character()
         title = "🧑 Cards per character"
-    else:
+    elif kind == "series":
         rows = db.get_card_counts_by_series()
         title = "🎬 Cards per series"
+    else:
+        rows = db.get_card_counts_by_event()
+        title = "🎉 Cards per event"
 
     total = db.get_total_character_count()
     if not rows:

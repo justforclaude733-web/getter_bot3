@@ -684,6 +684,23 @@ def get_card_counts_by_series():
     return rows
 
 
+def get_card_counts_by_event():
+    """How many cards exist in the bot for each event, most first. Cards
+    with no event_name are grouped together under 'No Event' rather than
+    dropped, so the totals here still add up to the full character count."""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT COALESCE(event_name, 'No Event') AS label, COUNT(*) AS count
+        FROM characters
+        GROUP BY label
+        ORDER BY (label = 'No Event') ASC, count DESC, label ASC
+    """)
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
 # ---------------- Characters ----------------
 
 def _next_available_character_id(cur) -> int:
