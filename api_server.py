@@ -633,7 +633,8 @@ async def _resolve_and_notify(battle_id: int, delay_seconds: float):
         return
 
     await _send_telegram_message(battle["attacker_id"], _battle_result_text(battle, battle["attacker_id"]))
-    await _send_telegram_message(battle["defender_id"], _battle_result_text(battle, battle["defender_id"]))
+    if battle["defender_id"] not in config.ARENA_NPC_IDS:
+        await _send_telegram_message(battle["defender_id"], _battle_result_text(battle, battle["defender_id"]))
     db.mark_battle_notified(battle_id)
 
 

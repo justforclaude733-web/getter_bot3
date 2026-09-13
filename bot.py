@@ -314,8 +314,13 @@ async def get_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Wrong name, try again!")
         return
 
-    db.give_character_to_user(user.id, user.username or user.first_name, character["id"])
-    db.clear_pending_spawn(chat_id)
+    claimed = db.claim_pending_spawn(chat_id, character["id"], user.id, user.username or user.first_name)
+    if not claimed:
+        # Someone else's /get won the race for this exact spawn between our
+        # read above and the atomic claim - nothing was given to us.
+        await update.message.reply_text("💨 Too slow! Someone already got that one.")
+        return
+
     daily_count = db.increment_daily_capture(user.id)
 
     milestone_messages = memories.record_acquisition(user.id, character, "get")
@@ -2617,7 +2622,7 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if character["rarity_name"]:
-        db.log_rarity_activity(character["rarity_name"], "check")
+        db.log_check_activity(character["rarity_name"], update.effective_user.id)
     memories.record_check(update.effective_user.id, character["id"])
 
     owners_count = db.count_owners(char_id)

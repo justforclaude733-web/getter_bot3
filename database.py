@@ -11,8 +11,9 @@ from datetime import datetime, timedelta
 from config import (
     DB_PATH, DEFAULT_CHARACTER_WEIGHT, FIGHTER_EVENT_NAME, ELEMENTS,
     FIGHTER_MAX_LEVEL, ARENA_BATTLE_DURATION_SECONDS, ARENA_LEAGUES,
-    ARENA_MATCH_UP_CHANCE, ARENA_MATCH_DOWN_CHANCE,
-    DAILY_TASK_BONUS, PREMIUM_DAILY_TASK_BONUS,
+    ARENA_MATCH_UP_CHANCE, ARENA_MATCH_DOWN_CHANCE, ARENA_NPC_OPPONENTS,
+    ARENA_NPC_IDS, DAILY_TASK_BONUS, PREMIUM_DAILY_TASK_BONUS,
+    PRICE_CHECK_DEDUP_WINDOW_SECONDS,
 )
 
 
@@ -240,6 +241,20 @@ def init_db():
     cur.execute("""
         CREATE INDEX IF NOT EXISTS idx_rarity_activity_log_name_time
         ON rarity_activity_log (rarity_name, created_at)
+    """)
+
+    # defensive migration: which user triggered a 'check' event, so
+    # log_check_activity() can dedupe repeated /check spam from the same
+    # user on the same rarity instead of letting it inflate the price.
+    # NULL for 'gift'/'sold' rows and for check rows logged before this
+    # column existed - both fine, they just aren't deduped retroactively.
+    try:
+        cur.execute("ALTER TABLE rarity_activity_log ADD COLUMN user_id INTEGER")
+    except sqlite3.OperationalError:
+        pass
+    cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_rarity_activity_log_user_check
+        ON rarity_activity_log (rarity_name, action, user_id, created_at)
     """)
 
     cur.execute("""
@@ -1252,6 +1267,33 @@ def log_rarity_activity(rarity_name: str, action: str):
     conn.close()
 
 
+def log_check_activity(rarity_name: str, user_id: int):
+    """Same economic signal as log_rarity_activity(rarity_name, "check"),
+    but only counts once per user per rarity within
+    config.PRICE_CHECK_DEDUP_WINDOW_SECONDS. Without this, a player could
+    spam /check on their own rarity of choice to push its live price up
+    for free - each repeat call inside the window is now a no-op."""
+    if not rarity_name:
+        return
+    conn = get_connection()
+    cur = conn.cursor()
+    cutoff = (datetime.utcnow() - timedelta(seconds=PRICE_CHECK_DEDUP_WINDOW_SECONDS)).isoformat()
+    cur.execute("""
+        SELECT 1 FROM rarity_activity_log
+        WHERE rarity_name = ? AND action = 'check' AND user_id = ? AND created_at >= ?
+        LIMIT 1
+    """, (rarity_name, user_id, cutoff))
+    if cur.fetchone():
+        conn.close()
+        return
+    cur.execute(
+        "INSERT INTO rarity_activity_log (rarity_name, action, user_id, created_at) VALUES (?, ?, ?, ?)",
+        (rarity_name, "check", user_id, datetime.utcnow().isoformat()),
+    )
+    conn.commit()
+    conn.close()
+
+
 def _log_rarity_activity_for_character(cur, character_id: int, action: str, now: str):
     """Same as log_rarity_activity, but reuses an existing cursor so the
     log entry commits atomically with whatever operation triggered it
@@ -1703,6 +1745,59 @@ def get_pending_spawn(chat_id: int):
     return row["pending_character_id"]
 
 
+def claim_pending_spawn(chat_id: int, character_id: int, user_id: int, username: str) -> bool:
+    """
+    Atomically claims a spawn: gives the character to user_id AND clears
+    the chat's pending spawn in a single transaction, but only if
+    character_id still matches what's actually pending for that chat.
+
+    This replaces the old get_pending_spawn -> give_character_to_user ->
+    clear_pending_spawn sequence used by /get, which was three separate
+    connections/commits - if two /get requests for the same spawn landed
+    close enough together, both could pass the "is there a pending spawn"
+    check before either cleared it, handing the same card out twice.
+
+    Here, the UPDATE's WHERE clause re-checks pending_character_id in the
+    same statement that clears it: SQLite serializes writers, so only one
+    of two racing callers can ever see rowcount == 1 for the same spawn.
+    The other gets rowcount == 0 back (returned as False) and knows
+    someone beat them to it - nothing else in this function runs for them.
+
+    Returns True if this call won the claim, False if the spawn was
+    already gone (claimed by someone else, or changed/cleared) by the
+    time this ran.
+    """
+    conn = sqlite3.connect(DB_PATH, isolation_level=None, timeout=10)
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    try:
+        cur.execute("BEGIN IMMEDIATE")
+        cur.execute(
+            "UPDATE chat_state SET pending_character_id = NULL, pending_spawn_message_id = NULL "
+            "WHERE chat_id = ? AND pending_character_id = ?",
+            (chat_id, character_id),
+        )
+        if cur.rowcount == 0:
+            cur.execute("ROLLBACK")
+            return False
+
+        cur.execute(
+            "INSERT INTO user_characters (user_id, username, character_id, obtained_at) VALUES (?, ?, ?, ?)",
+            (user_id, username, character_id, datetime.utcnow().isoformat()),
+        )
+        _init_fighter_fields_if_applicable(cur, cur.lastrowid, character_id)
+        cur.execute("COMMIT")
+        return True
+    except Exception:
+        try:
+            cur.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+        raise
+    finally:
+        conn.close()
+
+
 # ---------------- Anti-spam ----------------
 
 def register_message_for_spam(
@@ -1937,8 +2032,12 @@ def get_display_name(user_id: int) -> str:
     Best available human-readable name for a user: their first name
     (+ last name) if we've ever seen them interact with the bot or Mini
     App, otherwise their @username, otherwise a numbered fallback for a
-    player we truly have no info on yet.
+    player we truly have no info on yet. Arena NPC ids (negative,
+    never real Telegram users) short-circuit to their scripted name.
     """
+    if user_id in ARENA_NPC_IDS:
+        return next(n["name"] for n in ARENA_NPC_OPPONENTS if n["id"] == user_id)
+
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("SELECT username, first_name, last_name FROM bot_users WHERE user_id = ?", (user_id,))
@@ -3509,14 +3608,16 @@ def find_arena_opponent(user_id: int):
     player's own league; small independent chances to reach one league
     up or one league down instead - never further than that. Falls back
     to the player's own league, then to anyone with Fighter cards, if
-    the preferred league has nobody in it.
+    the preferred league has nobody in it. If literally nobody else owns
+    a Fighter card yet, hands back a scripted NPC id instead of None, so
+    the Arena isn't a dead feature for the first players in a fresh bot.
     """
     conn = get_connection()
     cur = conn.cursor()
     try:
         candidates = _fighter_owner_pool(cur, user_id)
         if not candidates:
-            return None
+            return random.choice(ARENA_NPC_OPPONENTS)["id"]
 
         my_league_idx = _league_index_for_trophies(get_trophies(user_id))
         max_idx = len(ARENA_LEAGUES) - 1
@@ -3608,29 +3709,39 @@ def start_arena_battle(attacker_id: int, attacker_username: str = None):
         if defender_id is None:
             return {"ok": False, "reason": "no_opponent"}
 
-        cur.execute("""
-            SELECT uc.current_defense FROM arena_teams at
-            JOIN user_characters uc ON uc.id = at.user_character_id
-            WHERE at.user_id = ? AND at.team_type = 'defense'
-            ORDER BY at.slot
-        """, (defender_id,))
-        defense_rows = cur.fetchall()
+        is_npc = defender_id in ARENA_NPC_IDS
 
-        if len(defense_rows) < 3:
-            # No saved Defense Team: auto-pick 3 random Fighter cards from
-            # the defender's own collection, for this battle only - never
-            # persisted as their real team.
+        if is_npc:
+            # No real account behind this id - nothing to look up in
+            # arena_teams/user_characters. Scale its defense straight off
+            # the challenger's own attack_power so the fight stays roughly
+            # fair whether this is someone's first battle or their 500th.
+            npc = next(n for n in ARENA_NPC_OPPONENTS if n["id"] == defender_id)
+            defense_power = round(attack_power * npc["power_multiplier"])
+        else:
             cur.execute("""
-                SELECT uc.current_defense FROM user_characters uc
-                JOIN fighter_stats fs ON fs.character_id = uc.character_id
-                WHERE uc.user_id = ?
+                SELECT uc.current_defense FROM arena_teams at
+                JOIN user_characters uc ON uc.id = at.user_character_id
+                WHERE at.user_id = ? AND at.team_type = 'defense'
+                ORDER BY at.slot
             """, (defender_id,))
-            owned = cur.fetchall()
-            if len(owned) < 3:
-                return {"ok": False, "reason": "opponent_no_defense"}
-            defense_rows = random.sample(owned, 3)
+            defense_rows = cur.fetchall()
 
-        defense_power = sum(r["current_defense"] or 0 for r in defense_rows)
+            if len(defense_rows) < 3:
+                # No saved Defense Team: auto-pick 3 random Fighter cards from
+                # the defender's own collection, for this battle only - never
+                # persisted as their real team.
+                cur.execute("""
+                    SELECT uc.current_defense FROM user_characters uc
+                    JOIN fighter_stats fs ON fs.character_id = uc.character_id
+                    WHERE uc.user_id = ?
+                """, (defender_id,))
+                owned = cur.fetchall()
+                if len(owned) < 3:
+                    return {"ok": False, "reason": "opponent_no_defense"}
+                defense_rows = random.sample(owned, 3)
+
+            defense_power = sum(r["current_defense"] or 0 for r in defense_rows)
 
         if attack_power > defense_power:
             result = "attacker"
@@ -3640,14 +3751,22 @@ def start_arena_battle(attacker_id: int, attacker_username: str = None):
             result = "draw"
 
         attacker_league = get_league_for_trophies(get_trophies(attacker_id))
-        defender_league = get_league_for_trophies(get_trophies(defender_id))
 
-        if result == "attacker":
-            atk_change, def_change = attacker_league["victory"], defender_league["defeat"]
-        elif result == "defender":
-            atk_change, def_change = attacker_league["defeat"], defender_league["victory"]
+        if is_npc:
+            # NPCs don't hold real trophies - the challenger still gains/
+            # loses based on their own league, the NPC side just isn't
+            # persisted anywhere.
+            def_change = 0
+            atk_change = attacker_league["victory"] if result == "attacker" \
+                else (attacker_league["defeat"] if result == "defender" else 0)
         else:
-            atk_change, def_change = 0, 0
+            defender_league = get_league_for_trophies(get_trophies(defender_id))
+            if result == "attacker":
+                atk_change, def_change = attacker_league["victory"], defender_league["defeat"]
+            elif result == "defender":
+                atk_change, def_change = attacker_league["defeat"], defender_league["victory"]
+            else:
+                atk_change, def_change = 0, 0
 
         now = datetime.utcnow()
         resolves_at = now + timedelta(seconds=ARENA_BATTLE_DURATION_SECONDS)
@@ -3688,7 +3807,8 @@ def resolve_arena_battle(battle_id: int):
             return None
 
         _apply_trophy_change(cur, battle["attacker_id"], battle["attacker_trophy_change"])
-        _apply_trophy_change(cur, battle["defender_id"], battle["defender_trophy_change"])
+        if battle["defender_id"] not in ARENA_NPC_IDS:
+            _apply_trophy_change(cur, battle["defender_id"], battle["defender_trophy_change"])
         cur.execute("UPDATE arena_battles SET resolved = 1 WHERE id = ?", (battle_id,))
         conn.commit()
 

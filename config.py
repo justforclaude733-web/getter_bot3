@@ -103,6 +103,21 @@ ARENA_LEAGUES = [
     {"key": "legend",     "name": "Eternal Legend",  "emoji": "🔥", "min": 5000, "victory": 15, "defeat": -25},
 ]
 
+# Fallback opponents used only when find_arena_opponent() finds literally
+# no other player who owns a Fighter card yet - keeps the Arena playable
+# for the very first players instead of /fight always failing with
+# "no_opponent". Negative ids so they can never collide with a real
+# Telegram user id. power_multiplier scales the NPC's defense_power off
+# whatever the challenger's own attack_power is for that fight (not off
+# a fixed number), so the match stays roughly fair at any stage.
+ARENA_NPC_OPPONENTS = [
+    {"id": -1, "name": "🎯 Training Dummy",  "power_multiplier": 0.6},
+    {"id": -2, "name": "🎲 Random Waifu",    "power_multiplier": 0.9},
+    {"id": -3, "name": "🤖 NPC Collector",   "power_multiplier": 1.0},
+    {"id": -4, "name": "🛡️ Arena Guardian", "power_multiplier": 1.3},
+]
+ARENA_NPC_IDS = {npc["id"] for npc in ARENA_NPC_OPPONENTS}
+
 # ==================== Dynamic rarity economy (/prices) ====================
 # "Day one" price range for each rarity tier, in CURRENCY_SYMBOL. The live
 # price /prices shows drifts away from these over time based on real
@@ -137,6 +152,11 @@ PRICE_UPDATE_INTERVAL_SECONDS = 60 * 60
 PRICE_GIFT_WEIGHT = 1.0          # a card of that rarity being /gift-ed
 PRICE_CHECK_WEIGHT = 0.3         # a card of that rarity being looked up with /check
 PRICE_MARKET_SOLD_WEIGHT = 2.0   # a card of that rarity actually selling on /market (strongest signal)
+
+# A single user spamming /check on the same rarity over and over only
+# counts once toward its price within this window - otherwise /check
+# activity would be a free, repeatable lever to pump a rarity's price.
+PRICE_CHECK_DEDUP_WINDOW_SECONDS = 60 * 60  # 1 hour
 
 # Scarcity: a tier with fewer total cards than this "typical" count gets
 # its price pushed up harder by the same amount of activity; more cards
