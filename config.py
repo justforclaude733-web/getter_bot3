@@ -213,9 +213,17 @@ EVENT_PRICE_TIERS = [
 # anyone's randomly-assigned monthly gift day.
 NIGHTLY_ENGAGEMENT_INTERVAL_SECONDS = 24 * 60 * 60
 
-# Rarity tiers the monthly gift draws from - Elysian through Sovereign
-# inclusive (see RARITY_BASE_PRICES for the full tier order).
-MONTHLY_GIFT_RARITY_TIERS = ["Elysian", "Prismatic", "Nocturne", "Sovereign"]
+# Rarity tier the monthly gift draws from. One random card from this
+# tier is given to every player once a month, on a random day that's
+# stable per-player (see memories._assigned_gift_day) so it's not the
+# same day for everyone. Previously also included Elysian/Prismatic/
+# Sovereign - narrowed to just Nocturne now that Sovereign is reserved
+# for the /birthday gift instead.
+MONTHLY_GIFT_RARITY_TIERS = ["Nocturne"]
+
+# Rarity given out by /birthday - once immediately on confirmation, then
+# automatically every year afterward on the same date.
+BIRTHDAY_GIFT_RARITY_NAME = "Sovereign"
 
 # ==================== Mini App premium themes ====================
 # Theme ids the Mini App accepts from /api/settings/theme. "default" is

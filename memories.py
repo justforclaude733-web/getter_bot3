@@ -331,9 +331,50 @@ def check_monthly_gifts() -> list:
     return results
 
 
+def check_birthday_gifts() -> list:
+    """Checks whether today is any confirmed birthday, and gives out a
+    random config.BIRTHDAY_GIFT_RARITY_NAME card to each player who's due
+    (i.e. hasn't already been gifted this calendar year - covers both the
+    very first year, where /birthday itself already gave the immediate
+    gift and stamped last_birthday_gift_year, and every year after that,
+    which is entirely this function's job). Returns (user_id, message)
+    pairs for the caller to send, same shape as check_monthly_gifts()."""
+    today = datetime.utcnow().date()
+    year, month, day = today.year, today.month, today.day
+
+    rarity = db.get_rarity_by_name(config.BIRTHDAY_GIFT_RARITY_NAME)
+    if not rarity:
+        return []
+
+    results = []
+    for row in db.list_users_with_birthday_today(month, day):
+        user_id = row["user_id"]
+        if row["last_birthday_gift_year"] == year:
+            continue  # already gifted this year
+
+        character = db.get_random_character_in_rarity_ids([rarity["id"]])
+        if not character:
+            continue
+
+        username = row["username"] or row["first_name"]
+        db.give_character_to_user(user_id, username, character["id"])
+        db.mark_birthday_gifted(user_id, year)
+
+        message = (
+            f"🎂 <b>Happy Birthday!</b>\n\n"
+            f"Your yearly <b>{config.BIRTHDAY_GIFT_RARITY_NAME}</b> gift: "
+            f"<b>{character['name']}</b> ({character['series']}).\n\nHave a great one! 🎉"
+        )
+        results.append((user_id, message))
+        for extra_message in record_acquisition(user_id, character, "birthday_gift"):
+            results.append((user_id, extra_message))
+
+    return results
+
+
 def run_nightly_engagement_loop():
     """Runs forever in a background thread: once roughly every 24 hours,
-    refresh cached favorites and check for monthly gifts."""
+    refresh cached favorites and check for monthly/birthday gifts."""
     while True:
         try:
             recompute_all_favorites()
@@ -345,5 +386,11 @@ def run_nightly_engagement_loop():
                 _send_telegram_message_sync(user_id, message)
         except Exception:
             logger.exception("Monthly gift check failed")
+
+        try:
+            for user_id, message in check_birthday_gifts():
+                _send_telegram_message_sync(user_id, message)
+        except Exception:
+            logger.exception("Birthday gift check failed")
 
         time.sleep(config.NIGHTLY_ENGAGEMENT_INTERVAL_SECONDS)

@@ -424,6 +424,17 @@ def init_db():
         except sqlite3.OperationalError:
             pass
 
+    # defensive migration: /birthday. month/day are set once (locked in
+    # by the player confirming "yes, today's my birthday") and never
+    # change; last_birthday_gift_year stops the same year's gift from
+    # being handed out twice (once immediately on confirmation, then
+    # again by the nightly loop the same day).
+    for col_def in ("birthday_month INTEGER", "birthday_day INTEGER", "last_birthday_gift_year INTEGER"):
+        try:
+            cur.execute(f"ALTER TABLE bot_users ADD COLUMN {col_def}")
+        except sqlite3.OperationalError:
+            pass
+
     cur.execute("""
         CREATE TABLE IF NOT EXISTS referrals (
             inviter_id INTEGER PRIMARY KEY,
@@ -973,6 +984,7 @@ def get_user_inventory(user_id: int, apply_filter: bool = True):
     base_query = """
         SELECT characters.id, characters.name, characters.series, characters.image_file_id,
                characters.media_type, characters.event_name,
+               characters.added_by_user_id, characters.added_by_username,
                rarities.name AS rarity_name, user_characters.obtained_at
         FROM user_characters
         JOIN characters ON user_characters.character_id = characters.id
@@ -2042,6 +2054,74 @@ def upsert_user_profile(user_id: int, username: str = None, first_name: str = No
     """, (user_id, datetime.utcnow().isoformat(), username, first_name, last_name))
     conn.commit()
     conn.close()
+
+
+# ---------------- /birthday ----------------
+
+def get_user_birthday(user_id: int):
+    """Returns (month, day) if this user has confirmed a birthday before,
+    otherwise None."""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT birthday_month, birthday_day FROM bot_users WHERE user_id = ?", (user_id,))
+    row = cur.fetchone()
+    conn.close()
+    if row and row["birthday_month"] and row["birthday_day"]:
+        return (row["birthday_month"], row["birthday_day"])
+    return None
+
+
+def set_user_birthday(user_id: int, month: int, day: int) -> bool:
+    """
+    Locks in a player's birthday - only if they don't already have one
+    set (a birthday is permanent once confirmed, so this can't be used
+    to re-roll it). Returns True if it was set just now, False if they
+    already had one (in which case nothing here changed).
+    """
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT birthday_month, birthday_day FROM bot_users WHERE user_id = ?", (user_id,))
+    row = cur.fetchone()
+    if row and row["birthday_month"] and row["birthday_day"]:
+        conn.close()
+        return False
+
+    now = datetime.utcnow().isoformat()
+    cur.execute("""
+        INSERT INTO bot_users (user_id, first_seen_at, birthday_month, birthday_day)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET
+            birthday_month = excluded.birthday_month,
+            birthday_day = excluded.birthday_day
+    """, (user_id, now, month, day))
+    conn.commit()
+    conn.close()
+    return True
+
+
+def mark_birthday_gifted(user_id: int, year: int):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("UPDATE bot_users SET last_birthday_gift_year = ? WHERE user_id = ?", (year, user_id))
+    conn.commit()
+    conn.close()
+
+
+def list_users_with_birthday_today(month: int, day: int):
+    """Everyone whose locked-in birthday is this month/day, regardless of
+    whether they've already been gifted this year - the caller (the
+    nightly loop) filters that out using last_birthday_gift_year, same as
+    the /birthday command's own immediate-gift path does."""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT user_id, username, first_name, last_birthday_gift_year
+        FROM bot_users
+        WHERE birthday_month = ? AND birthday_day = ?
+    """, (month, day))
+    rows = cur.fetchall()
+    conn.close()
+    return rows
 
 
 def get_display_name(user_id: int) -> str:

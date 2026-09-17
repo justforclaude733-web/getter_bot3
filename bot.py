@@ -1935,7 +1935,6 @@ async def constellation_inline_query(update: Update, context: ContextTypes.DEFAU
     """
     query_text = update.inline_query.query or ""
 
-    gallery_mode = False
     if query_text.startswith("constellation:"):
         try:
             owner_id = int(query_text.split(":", 1)[1])
@@ -1947,7 +1946,6 @@ async def constellation_inline_query(update: Update, context: ContextTypes.DEFAU
         items = db.search_characters(search_term)
     elif query_text.startswith("gallery:"):
         items = db.get_all_characters()
-        gallery_mode = True
     else:
         items = db.get_user_inventory(update.inline_query.from_user.id)
 
@@ -1960,18 +1958,18 @@ async def constellation_inline_query(update: Update, context: ContextTypes.DEFAU
         if not item["image_file_id"]:
             continue
         result_id = f"{item['id']}_{start + i}"
-        if gallery_mode:
-            owners_count = db.count_owners(item["id"])
-            caption = build_card_caption(item, owners_count)
-        else:
-            caption = f"{item['name']} ({item['series']})"
+        # Same full card info as /check, for every inline gallery this
+        # handler powers (constellation, search, gallery, and the
+        # no-query default) - not just the admin-facing gallery mode.
+        owners_count = db.count_owners(item["id"])
+        caption = build_card_caption(item, owners_count)
         if item["media_type"] == "video":
             results.append(InlineQueryResultCachedVideo(
                 id=result_id,
                 video_file_id=item["image_file_id"],
                 title=item["name"],
                 caption=caption,
-                parse_mode=ParseMode.HTML if gallery_mode else None,
+                parse_mode=ParseMode.HTML,
             ))
         else:
             results.append(InlineQueryResultCachedPhoto(
@@ -1979,7 +1977,7 @@ async def constellation_inline_query(update: Update, context: ContextTypes.DEFAU
                 photo_file_id=item["image_file_id"],
                 title=item["name"],
                 caption=caption,
-                parse_mode=ParseMode.HTML if gallery_mode else None,
+                parse_mode=ParseMode.HTML,
             ))
 
     next_offset = str(start + CONSTELLATION_PAGE_SIZE) if start + CONSTELLATION_PAGE_SIZE < len(items) else ""
@@ -3338,6 +3336,80 @@ async def memories_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
 
+# ---------------- /birthday ----------------
+
+async def birthday_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    existing = db.get_user_birthday(user.id)
+    if existing:
+        month, day = existing
+        await update.message.reply_text(
+            f"🎂 Your birthday's already locked in as <b>{month:02d}-{day:02d}</b>.\n"
+            f"You'll get a {config.BIRTHDAY_GIFT_RARITY_NAME} card automatically every year on that day.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Yes, today's my birthday", callback_data="birthday:confirm"),
+        InlineKeyboardButton("❌ No", callback_data="birthday:cancel"),
+    ]])
+    await update.message.reply_text(
+        "🎂 Is today <i>really</i> your birthday?\n\n"
+        "Confirming locks in today's date as your birthday for good, gives you a random "
+        f"{config.BIRTHDAY_GIFT_RARITY_NAME} card right now, and the same gift again automatically "
+        "every year on this day.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard,
+    )
+
+
+async def birthday_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    action = query.data.split(":", 1)[1]
+    user = query.from_user
+
+    if action == "cancel":
+        await query.edit_message_text("👍 No problem - come back on your actual birthday!")
+        return
+
+    # action == "confirm" - set_user_birthday() itself refuses to overwrite
+    # an existing birthday, so this is safe even against a double-tap.
+    today = datetime.utcnow().date()
+    newly_set = db.set_user_birthday(user.id, today.month, today.day)
+    if not newly_set:
+        await query.edit_message_text("🎂 Your birthday's already locked in from before.")
+        return
+
+    rarity = db.get_rarity_by_name(config.BIRTHDAY_GIFT_RARITY_NAME)
+    character = db.get_random_character_in_rarity_ids([rarity["id"]]) if rarity else None
+    if not character:
+        await query.edit_message_text(
+            f"🎂 Happy birthday! Your birthday is locked in as {today.month:02d}-{today.day:02d}, "
+            f"but there's no {config.BIRTHDAY_GIFT_RARITY_NAME} card in the bot yet for your gift - "
+            "bug the owner about it!"
+        )
+        return
+
+    db.give_character_to_user(user.id, user.username or user.first_name, character["id"])
+    db.mark_birthday_gifted(user.id, today.year)
+
+    await query.edit_message_text(
+        f"🎉 Happy Birthday! Locked in as <b>{today.month:02d}-{today.day:02d}</b>.\n\n"
+        f"🎁 Your gift: <b>{character['name']}</b> ({character['series']}) - "
+        f"a {config.BIRTHDAY_GIFT_RARITY_NAME} card!\n\n"
+        "You'll get another one automatically, every year, on this day. 🥳",
+        parse_mode=ParseMode.HTML,
+    )
+
+    for extra_message in memories.record_acquisition(user.id, character, "birthday_gift"):
+        try:
+            await context.bot.send_message(chat_id=user.id, text=extra_message, parse_mode=ParseMode.HTML)
+        except Exception:
+            logger.exception("Failed to send birthday milestone message to %s", user.id)
+
+
 # ---------------- /start ----------------
 
 START_TEXT = (
@@ -3832,6 +3904,8 @@ def main():
     app.add_handler(CommandHandler("prices", prices_command))
     app.add_handler(CallbackQueryHandler(prices_callback, pattern=r"^prices:"))
     app.add_handler(CommandHandler("memories", memories_command))
+    app.add_handler(CommandHandler("birthday", birthday_command))
+    app.add_handler(CallbackQueryHandler(birthday_callback, pattern=r"^birthday:"))
     app.add_handler(CommandHandler("search", search_command))
     app.add_handler(CommandHandler("sort", sort_command))
     app.add_handler(CallbackQueryHandler(sort_menu_callback, pattern=r"^sortmenu:"))
