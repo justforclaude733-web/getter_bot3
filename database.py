@@ -937,6 +937,33 @@ def count_owners(character_id: int):
     return row["c"]
 
 
+def get_random_owner_names(character_id: int, limit: int = 5):
+    """Up to `limit` distinct owners of this character, picked at random.
+    Shows their real @username when we know one (from bot_users, kept
+    fresh on every interaction), falling back to get_display_name only
+    for owners with no username set - puts a few real names behind
+    /check's 'Claimed by N Keepers' count."""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT DISTINCT user_id FROM user_characters WHERE character_id = ?", (character_id,))
+    owner_ids = [row["user_id"] for row in cur.fetchall()]
+    if not owner_ids:
+        conn.close()
+        return []
+
+    sample = random.sample(owner_ids, min(limit, len(owner_ids)))
+    names = []
+    for uid in sample:
+        cur.execute("SELECT username FROM bot_users WHERE user_id = ?", (uid,))
+        row = cur.fetchone()
+        if row and row["username"]:
+            names.append(f"@{row['username']}")
+        else:
+            names.append(get_display_name(uid))
+    conn.close()
+    return names
+
+
 def _init_fighter_fields_if_applicable(cur, user_character_id: int, character_id: int):
     """
     If character_id is a registered Fighter, stamps the freshly-inserted

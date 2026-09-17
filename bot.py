@@ -2596,12 +2596,15 @@ def build_card_caption(character, owners_count: int) -> str:
         lines.append(f"✦ 🛡 𝐹𝑖𝑔ℎ𝑡𝑒𝑟: {elem.get('label', fighter['element'])}")
         lines.append(f"✦ 𝐵𝑎𝑠𝑒 𝐴𝑇𝐾: {fighter['base_attack']}  |  𝐵𝑎𝑠𝑒 𝐷𝐸𝐹: {fighter['base_defense']}")
 
+    owner_names = db.get_random_owner_names(character["id"], 5)
     lines += [
         "",
         "──────── ✦ ────────",
         "",
         f"🌠 𝐶la𝐢𝐦𝐞𝐝 𝛃𝛶 {owners_count} 𝛫𝐞𝐞𝛒ers",
     ]
+    if owner_names:
+        lines.append(", ".join(owner_names))
     return "\n".join(lines)
 
 
@@ -2991,42 +2994,159 @@ async def edit_character_command(update: Update, context: ContextTypes.DEFAULT_T
         await update.message.reply_text("⛔ You're not allowed to use this command.")
         return
 
-    text = update.message.text or ""
-    body = text.split(None, 1)[1] if " " in text else ""
-    parts = [p.strip() for p in body.split("|")]
-
-    if len(parts) < 3 or not parts[0]:
-        await update.message.reply_text(
-            "⚠️ Usage: <code>/editcharacter ID | Name | Series | Rarity(optional) | Event(optional)</code>",
-            parse_mode=ParseMode.HTML,
-        )
+    if not context.args:
+        await update.message.reply_text("⚠️ Usage: <code>/editcharacter [ID]</code>", parse_mode=ParseMode.HTML)
         return
 
     try:
-        char_id = int(parts[0])
+        char_id = int(context.args[0])
     except ValueError:
         await update.message.reply_text("⚠️ ID must be a number.")
         return
 
-    name, series = parts[1], parts[2]
-    rarity_name = parts[3] if len(parts) > 3 and parts[3] else None
-    event_name = parts[4] if len(parts) > 4 and parts[4] else None
-    event_was_dropped = bool(event_name) and not db.event_exists(event_name)
-
-    if db.update_character(char_id, name, series, rarity_name, event_name):
-        reply = f"✅ Character #{char_id} updated."
-        if event_was_dropped:
-            reply += f"\n⚠️ Event \"{event_name}\" isn't registered (see /addevent) - saved without an event."
-        character = db.get_character(char_id)
-        if character:
-            await send_character_result(
-                context, update.effective_chat.id, character, reply,
-                reply_to_message_id=update.message.message_id,
-            )
-        else:
-            await update.message.reply_text(reply, parse_mode=ParseMode.HTML)
-    else:
+    character = db.get_character(char_id)
+    if not character:
         await update.message.reply_text(f"❓ No character found with ID #{char_id}.")
+        return
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📝 Name", callback_data=f"editchar:field:name:{char_id}"),
+            InlineKeyboardButton("🎬 Series", callback_data=f"editchar:field:series:{char_id}"),
+        ],
+        [
+            InlineKeyboardButton("💎 Rarity", callback_data=f"editchar:field:rarity:{char_id}"),
+            InlineKeyboardButton("🎉 Event", callback_data=f"editchar:field:event:{char_id}"),
+        ],
+    ])
+    await update.message.reply_text(
+        f"✏️ Editing <b>{character['name']}</b> (#{char_id}) - what do you want to change?",
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard,
+    )
+
+
+async def edit_character_field_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Step 1 of /editcharacter: the admin just picked which field to
+    change. Name/Series need a typed value next; Rarity/Event show a
+    button list instead, since those have to match something that
+    already exists."""
+    query = update.callback_query
+    user = query.from_user
+    if not (is_admin(user.id) or is_artist(user.id) or is_manager(user.id) or is_marzieh(user.id)):
+        await query.answer("⛔ You're not allowed to use this.", show_alert=True)
+        return
+    await query.answer()
+
+    _, _, field, char_id_str = query.data.split(":")
+    char_id = int(char_id_str)
+    character = db.get_character(char_id)
+    if not character:
+        await query.edit_message_text(f"❓ Character #{char_id} no longer exists.")
+        return
+
+    if field in ("name", "series"):
+        context.user_data["awaiting_editcharacter"] = {"char_id": char_id, "field": field}
+        label = "name" if field == "name" else "series"
+        await query.edit_message_text(
+            f"✏️ Send the new {label} for <b>{character['name']}</b> (#{char_id}):",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if field == "rarity":
+        rarities = db.list_rarities()
+        buttons = [
+            [InlineKeyboardButton(r["name"], callback_data=f"editchar:setrarity:{char_id}:{r['id']}")]
+            for r in rarities
+        ]
+        buttons.append([InlineKeyboardButton("🚫 Unranked (no rarity)", callback_data=f"editchar:setrarity:{char_id}:none")])
+        await query.edit_message_text(
+            f"💎 Pick a new rarity for <b>{character['name']}</b> (#{char_id}):",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+        return
+
+    # field == "event"
+    events = db.get_all_events()
+    buttons = [
+        [InlineKeyboardButton(f"🔒 {ev['name']}" if ev["locked"] else ev["name"], callback_data=f"editchar:setevent:{char_id}:{i}")]
+        for i, ev in enumerate(events)
+    ]
+    buttons.append([InlineKeyboardButton("🚫 No event", callback_data=f"editchar:setevent:{char_id}:none")])
+    await query.edit_message_text(
+        f"🎉 Pick a new event for <b>{character['name']}</b> (#{char_id}):",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
+async def edit_character_apply_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Step 2 for Rarity/Event: the admin picked one of the listed
+    options, apply it straight away - name/series stay whatever they
+    already were."""
+    query = update.callback_query
+    user = query.from_user
+    if not (is_admin(user.id) or is_artist(user.id) or is_manager(user.id) or is_marzieh(user.id)):
+        await query.answer("⛔ You're not allowed to use this.", show_alert=True)
+        return
+    await query.answer()
+
+    _, kind, char_id_str, value = query.data.split(":")
+    char_id = int(char_id_str)
+    character = db.get_character(char_id)
+    if not character:
+        await query.edit_message_text(f"❓ Character #{char_id} no longer exists.")
+        return
+
+    if kind == "setrarity":
+        if value == "none":
+            new_rarity_name = None
+        else:
+            rarity = next((r for r in db.list_rarities() if r["id"] == int(value)), None)
+            new_rarity_name = rarity["name"] if rarity else None
+        db.update_character(char_id, character["name"], character["series"], new_rarity_name, character["event_name"])
+        field_label, new_label = "Rarity", (new_rarity_name or "Unranked")
+    else:  # setevent
+        if value == "none":
+            new_event_name = None
+        else:
+            events = db.get_all_events()
+            idx = int(value)
+            new_event_name = events[idx]["name"] if 0 <= idx < len(events) else None
+        db.update_character(char_id, character["name"], character["series"], character["rarity_name"], new_event_name)
+        field_label, new_label = "Event", (new_event_name or "No event")
+
+    updated = db.get_character(char_id)
+    await query.edit_message_text(f"✅ {field_label} for <b>{updated['name']}</b> (#{char_id}) set to: {new_label}", parse_mode=ParseMode.HTML)
+
+
+async def capture_edit_character_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Runs in its own handler group - only acts when an admin has an
+    active /editcharacter Name/Series prompt waiting for a typed value."""
+    pending = context.user_data.get("awaiting_editcharacter")
+    if not pending:
+        return
+
+    value = update.message.text.strip() if update.message.text else ""
+    if not value:
+        return
+
+    char_id, field = pending["char_id"], pending["field"]
+    character = db.get_character(char_id)
+    if not character:
+        context.user_data.pop("awaiting_editcharacter", None)
+        await update.message.reply_text(f"❓ Character #{char_id} no longer exists.")
+        return
+
+    name = value if field == "name" else character["name"]
+    series = value if field == "series" else character["series"]
+    db.update_character(char_id, name, series, character["rarity_name"], character["event_name"])
+    context.user_data.pop("awaiting_editcharacter", None)
+
+    label = "Name" if field == "name" else "Series"
+    await update.message.reply_text(f"✅ {label} for character #{char_id} updated to: {value}")
 
 
 # ---------------- Admin: /setpersonality (Chat tab) ----------------
@@ -3931,6 +4051,8 @@ def main():
     app.add_handler(CallbackQueryHandler(add_flow_callback, pattern=r"^addflow:"))
     app.add_handler(CallbackQueryHandler(submission_callback, pattern=r"^submit:"))
     app.add_handler(CommandHandler("editcharacter", edit_character_command))
+    app.add_handler(CallbackQueryHandler(edit_character_field_callback, pattern=r"^editchar:field:"))
+    app.add_handler(CallbackQueryHandler(edit_character_apply_callback, pattern=r"^editchar:(setrarity|setevent):"))
     app.add_handler(CommandHandler("setpersonality", set_personality_command))
     app.add_handler(CommandHandler("editrarity", edit_rarity_command))
     app.add_handler(CommandHandler("addrarity", add_rarity_command))
@@ -3989,6 +4111,7 @@ def main():
 
     # its own group - only acts when the owner has an active /player prompt
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, capture_player_input), group=3)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, capture_edit_character_input), group=4)
 
     # counts every normal group text message for spawn + spam tracking
     app.add_handler(MessageHandler(
