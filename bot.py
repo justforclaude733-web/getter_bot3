@@ -3199,6 +3199,9 @@ async def new_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             result = db.claim_new_card_button(
                 button_id, user.id, user.username or user.first_name
             )
+            if result["status"] == "already_claimed":
+                await query.answer("⚠️ You have already claimed this reward.", show_alert=True)
+                return
             if result["status"] == "exhausted":
                 await query.answer("⛔ This button has reached its usage limit.", show_alert=True)
                 return
@@ -3226,6 +3229,9 @@ async def new_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.answer("⚠️ Invalid VɎ amount.", show_alert=True)
                 return
             result = db.claim_new_vy_button(button_id, user.id, amount)
+            if result["status"] == "already_claimed":
+                await query.answer("⚠️ You have already claimed this reward.", show_alert=True)
+                return
             if result["status"] == "exhausted":
                 await query.answer("⛔ This button has reached its usage limit.", show_alert=True)
                 return

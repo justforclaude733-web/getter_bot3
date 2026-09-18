@@ -251,6 +251,22 @@ def init_db():
     """)
 
     cur.execute("""
+        CREATE TABLE IF NOT EXISTS new_post_button_claims (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            button_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            claimed_at TEXT NOT NULL,
+            UNIQUE(button_id, user_id),
+            FOREIGN KEY (button_id) REFERENCES new_post_buttons(id) ON DELETE CASCADE
+        )
+    """)
+
+    cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_new_post_button_claims_button_user
+        ON new_post_button_claims(button_id, user_id)
+    """)
+
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS bin_items (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             kind TEXT NOT NULL,
@@ -2965,7 +2981,7 @@ def grant_character_copy(user_id: int, username: str, character_id: int) -> bool
 
 
 def claim_new_card_button(button_id: int, user_id: int, username: str):
-    """Atomically consume one card-button use and grant the card copy."""
+    """Atomically allow one user to claim a card-button reward only once."""
     conn = get_connection()
     cur = conn.cursor()
     try:
@@ -2974,6 +2990,7 @@ def claim_new_card_button(button_id: int, user_id: int, username: str):
         if not button or button["action_type"] != "card":
             conn.rollback()
             return {"status": "invalid"}
+
         try:
             character_id = int(button["action_data"])
         except (TypeError, ValueError):
@@ -2985,6 +3002,14 @@ def claim_new_card_button(button_id: int, user_id: int, username: str):
             conn.rollback()
             return {"status": "invalid"}
 
+        cur.execute(
+            "SELECT 1 FROM new_post_button_claims WHERE button_id = ? AND user_id = ?",
+            (button_id, user_id),
+        )
+        if cur.fetchone():
+            conn.rollback()
+            return {"status": "already_claimed"}
+
         cur.execute("""
             UPDATE new_post_buttons
             SET uses = uses + 1
@@ -2995,12 +3020,19 @@ def claim_new_card_button(button_id: int, user_id: int, username: str):
             return {"status": "exhausted"}
 
         cur.execute(
+            "INSERT INTO new_post_button_claims (button_id, user_id, claimed_at) VALUES (?, ?, ?)",
+            (button_id, user_id, datetime.utcnow().isoformat()),
+        )
+        cur.execute(
             "INSERT INTO user_characters (user_id, username, character_id, obtained_at) VALUES (?, ?, ?, ?)",
             (user_id, username, character_id, datetime.utcnow().isoformat()),
         )
         _init_fighter_fields_if_applicable(cur, cur.lastrowid, character_id)
         conn.commit()
         return {"status": "ok", "character_id": character_id}
+    except sqlite3.IntegrityError:
+        conn.rollback()
+        return {"status": "already_claimed"}
     except Exception:
         conn.rollback()
         raise
@@ -3009,7 +3041,7 @@ def claim_new_card_button(button_id: int, user_id: int, username: str):
 
 
 def claim_new_vy_button(button_id: int, user_id: int, amount: int):
-    """Atomically consume one VɎ-button use and credit the user's balance."""
+    """Atomically allow one user to claim a VɎ-button reward only once."""
     if amount <= 0:
         return {"status": "invalid"}
     conn = get_connection()
@@ -3021,6 +3053,14 @@ def claim_new_vy_button(button_id: int, user_id: int, amount: int):
             conn.rollback()
             return {"status": "invalid"}
 
+        cur.execute(
+            "SELECT 1 FROM new_post_button_claims WHERE button_id = ? AND user_id = ?",
+            (button_id, user_id),
+        )
+        if cur.fetchone():
+            conn.rollback()
+            return {"status": "already_claimed"}
+
         cur.execute("""
             UPDATE new_post_buttons
             SET uses = uses + 1
@@ -3030,6 +3070,10 @@ def claim_new_vy_button(button_id: int, user_id: int, amount: int):
             conn.rollback()
             return {"status": "exhausted"}
 
+        cur.execute(
+            "INSERT INTO new_post_button_claims (button_id, user_id, claimed_at) VALUES (?, ?, ?)",
+            (button_id, user_id, datetime.utcnow().isoformat()),
+        )
         cur.execute("""
             INSERT INTO currency (user_id, balance)
             VALUES (?, ?)
@@ -3040,6 +3084,9 @@ def claim_new_vy_button(button_id: int, user_id: int, amount: int):
         row = cur.fetchone()
         conn.commit()
         return {"status": "ok", "balance": row["balance"]}
+    except sqlite3.IntegrityError:
+        conn.rollback()
+        return {"status": "already_claimed"}
     except Exception:
         conn.rollback()
         raise
