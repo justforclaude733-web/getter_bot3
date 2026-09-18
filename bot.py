@@ -246,9 +246,28 @@ async def set_force_join_command(update: Update, context: ContextTypes.DEFAULT_T
         )
         return
 
-    db.set_force_join_settings(chat.id, FORCE_JOIN_LINK)
+    # Create a bot-owned permanent invite link instead of relying on the
+    # original/private link supplied during setup. This link has no expiration
+    # or usage limit unless it is explicitly revoked by an administrator.
+    try:
+        invite = await context.bot.create_chat_invite_link(
+            chat_id=chat.id,
+            name="Bot force-join",
+            creates_join_request=False,
+        )
+        invite_link = invite.invite_link
+    except Exception:
+        logger.exception("Failed to create permanent force-join invite link for chat %s", chat.id)
+        await update.effective_message.reply_text(
+            "⚠️ I couldn't create a permanent invite link. Please make sure I am an administrator "
+            "with permission to invite users, then try again."
+        )
+        return
+
+    db.set_force_join_settings(chat.id, invite_link)
     await update.effective_message.reply_text(
         "✅ Force-join group configured.\n\n"
+        "A permanent invite link was created for this group.\n"
         "From now on, users must be members of this group to use the bot, "
         "and leaving the group will remove their access immediately."
     )
