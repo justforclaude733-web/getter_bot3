@@ -565,9 +565,8 @@ async def inventory_currency_command(update: Update, context: ContextTypes.DEFAU
     display_name = db.get_display_name(user.id)
 
     lines = [
-        "╔════════════════════════╗",
-        f"║                    🎒 {_bold_sans('INVENTORY')}                    ║",
-        "╚════════════════════════╝",
+        f"🎒 {_bold_sans('INVENTORY')} ",
+        "",
         f"       👤 {display_name}",
         f"       🏆 {_bold_sans('Rank')}  {rank_text}",
         "",
@@ -576,8 +575,6 @@ async def inventory_currency_command(update: Update, context: ContextTypes.DEFAU
         "",
         f"       🎴 {_bold_sans(f'{card_count:,}')}",
         f"          {_bold_sans('CARDS')}",
-        "",
-        " ╔╗╚╝╔╗╚╝╔╗╚╝╔╗╚╝╔╗╚╝╔╗╚╝╔╗",
     ]
     text = "\n".join(lines)
 
@@ -1981,7 +1978,10 @@ async def constellation_inline_query(update: Update, context: ContextTypes.DEFAU
     elif query_text.startswith("gallery:"):
         items = db.get_all_characters()
     else:
-        items = db.get_user_inventory(update.inline_query.from_user.id)
+        # Someone typed the bot's @username with no extra query text (just
+        # opening the inline keyboard) - show the full game gallery, not
+        # only the cards this person happens to own.
+        items = db.get_all_characters()
 
     offset = update.inline_query.offset
     start = int(offset) if offset else 0
@@ -2048,14 +2048,22 @@ def _is_aevoria_rarity(rarity_name: str) -> bool:
 # walk the sender through two button menus - rarity, then event - skipping
 # any step that has nothing to pick from, before finalizing.
 
+def _grid_rows(buttons, columns=3):
+    """Lays a flat list of InlineKeyboardButtons out into rows of `columns`
+    buttons each (last row may be shorter). Used to turn long one-per-row
+    picker lists (rarity, event) into a compact grid."""
+    return [buttons[i:i + columns] for i in range(0, len(buttons), columns)]
+
+
 def _rarity_picker_keyboard(pending_id: str):
     rarities = db.list_rarities()
     if not rarities:
         return None
-    rows = [
-        [InlineKeyboardButton(r["name"], callback_data=f"addflow:rarity:{pending_id}:{r['id']}")]
+    buttons = [
+        InlineKeyboardButton(r["name"], callback_data=f"addflow:rarity:{pending_id}:{r['id']}")
         for r in rarities
     ]
+    rows = _grid_rows(buttons)
     rows.append([InlineKeyboardButton("🚫 Unranked (no rarity)", callback_data=f"addflow:rarity:{pending_id}:none")])
     return InlineKeyboardMarkup(rows)
 
@@ -2067,10 +2075,11 @@ def _event_picker_keyboard(pending_id: str, pending: dict):
     # Event names can contain characters unsafe for callback_data, so we
     # reference them by index into this cached list instead of by name.
     pending["_event_options"] = [e["name"] for e in events]
-    rows = [
-        [InlineKeyboardButton(e["name"], callback_data=f"addflow:event:{pending_id}:{i}")]
+    buttons = [
+        InlineKeyboardButton(e["name"], callback_data=f"addflow:event:{pending_id}:{i}")
         for i, e in enumerate(events)
     ]
+    rows = _grid_rows(buttons)
     rows.append([InlineKeyboardButton("🚫 No event", callback_data=f"addflow:event:{pending_id}:none")])
     return InlineKeyboardMarkup(rows)
 
@@ -3156,28 +3165,30 @@ async def edit_character_field_callback(update: Update, context: ContextTypes.DE
     if field == "rarity":
         rarities = db.list_rarities()
         buttons = [
-            [InlineKeyboardButton(r["name"], callback_data=f"editchar:setrarity:{char_id}:{r['id']}")]
+            InlineKeyboardButton(r["name"], callback_data=f"editchar:setrarity:{char_id}:{r['id']}")
             for r in rarities
         ]
-        buttons.append([InlineKeyboardButton("🚫 Unranked (no rarity)", callback_data=f"editchar:setrarity:{char_id}:none")])
+        rows = _grid_rows(buttons)
+        rows.append([InlineKeyboardButton("🚫 Unranked (no rarity)", callback_data=f"editchar:setrarity:{char_id}:none")])
         await query.edit_message_text(
             f"💎 Pick a new rarity for <b>{character['name']}</b> (#{char_id}):",
             parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup(buttons),
+            reply_markup=InlineKeyboardMarkup(rows),
         )
         return
 
     # field == "event"
     events = db.get_all_events()
     buttons = [
-        [InlineKeyboardButton(f"🔒 {ev['name']}" if ev["locked"] else ev["name"], callback_data=f"editchar:setevent:{char_id}:{i}")]
+        InlineKeyboardButton(f"🔒 {ev['name']}" if ev["locked"] else ev["name"], callback_data=f"editchar:setevent:{char_id}:{i}")
         for i, ev in enumerate(events)
     ]
-    buttons.append([InlineKeyboardButton("🚫 No event", callback_data=f"editchar:setevent:{char_id}:none")])
+    rows = _grid_rows(buttons)
+    rows.append([InlineKeyboardButton("🚫 No event", callback_data=f"editchar:setevent:{char_id}:none")])
     await query.edit_message_text(
         f"🎉 Pick a new event for <b>{character['name']}</b> (#{char_id}):",
         parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup(buttons),
+        reply_markup=InlineKeyboardMarkup(rows),
     )
 
 
