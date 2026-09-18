@@ -206,6 +206,50 @@ def init_db():
         )
     """)
 
+    # ---------------- /new channel publisher ----------------
+    # Stores the last channel target so the owner only has to provide it
+    # once. A channel target can be a public @username or a Telegram
+    # channel numeric id parsed from a t.me/c/... link.
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS new_channel_settings (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            channel_target TEXT NOT NULL,
+            channel_link TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS new_posts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            channel_target TEXT NOT NULL,
+            message_id INTEGER NOT NULL,
+            fa_text TEXT NOT NULL,
+            en_text TEXT NOT NULL,
+            created_by INTEGER NOT NULL,
+            created_at TEXT NOT NULL
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS new_post_buttons (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            post_id INTEGER NOT NULL,
+            label TEXT NOT NULL,
+            action_type TEXT NOT NULL,
+            action_data TEXT,
+            max_uses INTEGER,
+            uses INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (post_id) REFERENCES new_posts(id) ON DELETE CASCADE
+        )
+    """)
+
+    cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_new_post_buttons_post_id
+        ON new_post_buttons(post_id)
+    """)
+
     cur.execute("""
         CREATE TABLE IF NOT EXISTS bin_items (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2782,6 +2826,225 @@ def restore_all_bin_items(kind: str) -> int:
     conn.commit()
     conn.close()
     return restored
+
+
+# ---------------- /new channel publisher ----------------
+
+def get_new_channel_setting():
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM new_channel_settings WHERE id = 1")
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+
+def set_new_channel_setting(channel_target: str, channel_link: str):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO new_channel_settings (id, channel_target, channel_link, updated_at)
+        VALUES (1, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            channel_target = excluded.channel_target,
+            channel_link = excluded.channel_link,
+            updated_at = excluded.updated_at
+    """, (channel_target, channel_link, datetime.utcnow().isoformat()))
+    conn.commit()
+    conn.close()
+
+
+def create_new_post(channel_target: str, message_id: int, fa_text: str, en_text: str, created_by: int, buttons=None):
+    conn = get_connection()
+    cur = conn.cursor()
+    now = datetime.utcnow().isoformat()
+    cur.execute("""
+        INSERT INTO new_posts (channel_target, message_id, fa_text, en_text, created_by, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (channel_target, message_id, fa_text, en_text, created_by, now))
+    post_id = cur.lastrowid
+    for button in buttons or []:
+        cur.execute("""
+            INSERT INTO new_post_buttons
+                (post_id, label, action_type, action_data, max_uses, uses, created_at)
+            VALUES (?, ?, ?, ?, ?, 0, ?)
+        """, (
+            post_id, button["label"], button["action_type"], button.get("action_data"),
+            button.get("max_uses"), now,
+        ))
+    conn.commit()
+    conn.close()
+    return post_id
+
+
+def get_new_post(post_id: int):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM new_posts WHERE id = ?", (post_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+
+def get_new_post_buttons(post_id: int):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM new_post_buttons WHERE post_id = ? ORDER BY id", (post_id,))
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def get_new_post_button(button_id: int):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM new_post_buttons WHERE id = ?", (button_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+
+def update_new_post_message_id(post_id: int, message_id: int):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("UPDATE new_posts SET message_id = ? WHERE id = ?", (message_id, post_id))
+    conn.commit()
+    conn.close()
+
+
+def delete_new_post(post_id: int):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM new_post_buttons WHERE post_id = ?", (post_id,))
+    cur.execute("DELETE FROM new_posts WHERE id = ?", (post_id,))
+    conn.commit()
+    conn.close()
+
+
+def consume_new_post_button(button_id: int):
+    """Atomically consumes one global use of a /new custom button.
+    Returns the button row after consumption, or None when exhausted/not found."""
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            UPDATE new_post_buttons
+            SET uses = uses + 1
+            WHERE id = ? AND (max_uses IS NULL OR uses < max_uses)
+        """, (button_id,))
+        if cur.rowcount != 1:
+            conn.rollback()
+            return None
+        cur.execute("SELECT * FROM new_post_buttons WHERE id = ?", (button_id,))
+        row = cur.fetchone()
+        conn.commit()
+        return row
+    finally:
+        conn.close()
+
+
+def grant_character_copy(user_id: int, username: str, character_id: int) -> bool:
+    """Give a player one fresh copy of a character, without requiring a
+    source owner. Used by /new's public claim-card buttons."""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM characters WHERE id = ?", (character_id,))
+    if not cur.fetchone():
+        conn.close()
+        return False
+    now = datetime.utcnow().isoformat()
+    cur.execute(
+        "INSERT INTO user_characters (user_id, username, character_id, obtained_at) VALUES (?, ?, ?, ?)",
+        (user_id, username, character_id, now),
+    )
+    _init_fighter_fields_if_applicable(cur, cur.lastrowid, character_id)
+    conn.commit()
+    conn.close()
+    return True
+
+
+
+def claim_new_card_button(button_id: int, user_id: int, username: str):
+    """Atomically consume one card-button use and grant the card copy."""
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT * FROM new_post_buttons WHERE id = ?", (button_id,))
+        button = cur.fetchone()
+        if not button or button["action_type"] != "card":
+            conn.rollback()
+            return {"status": "invalid"}
+        try:
+            character_id = int(button["action_data"])
+        except (TypeError, ValueError):
+            conn.rollback()
+            return {"status": "invalid"}
+
+        cur.execute("SELECT id FROM characters WHERE id = ?", (character_id,))
+        if not cur.fetchone():
+            conn.rollback()
+            return {"status": "invalid"}
+
+        cur.execute("""
+            UPDATE new_post_buttons
+            SET uses = uses + 1
+            WHERE id = ? AND (max_uses IS NULL OR uses < max_uses)
+        """, (button_id,))
+        if cur.rowcount != 1:
+            conn.rollback()
+            return {"status": "exhausted"}
+
+        cur.execute(
+            "INSERT INTO user_characters (user_id, username, character_id, obtained_at) VALUES (?, ?, ?, ?)",
+            (user_id, username, character_id, datetime.utcnow().isoformat()),
+        )
+        _init_fighter_fields_if_applicable(cur, cur.lastrowid, character_id)
+        conn.commit()
+        return {"status": "ok", "character_id": character_id}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def claim_new_vy_button(button_id: int, user_id: int, amount: int):
+    """Atomically consume one VɎ-button use and credit the user's balance."""
+    if amount <= 0:
+        return {"status": "invalid"}
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT action_type FROM new_post_buttons WHERE id = ?", (button_id,))
+        button = cur.fetchone()
+        if not button or button["action_type"] != "vy":
+            conn.rollback()
+            return {"status": "invalid"}
+
+        cur.execute("""
+            UPDATE new_post_buttons
+            SET uses = uses + 1
+            WHERE id = ? AND (max_uses IS NULL OR uses < max_uses)
+        """, (button_id,))
+        if cur.rowcount != 1:
+            conn.rollback()
+            return {"status": "exhausted"}
+
+        cur.execute("""
+            INSERT INTO currency (user_id, balance)
+            VALUES (?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET balance = balance + excluded.balance
+        """, (user_id, amount))
+        _track_currency_delta(cur, user_id, amount)
+        cur.execute("SELECT balance FROM currency WHERE user_id = ?", (user_id,))
+        row = cur.fetchone()
+        conn.commit()
+        return {"status": "ok", "balance": row["balance"]}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 # ---------------- Spawn lock status ----------------
