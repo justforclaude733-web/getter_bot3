@@ -3249,6 +3249,24 @@ def get_richest_users(limit: int = 50):
     return rows
 
 
+def get_richest_rank(user_id: int):
+    """1-based rank of this user on the richest-players leaderboard (same
+    ordering as get_richest_users, the one behind the Mini App's leaderboard).
+    Returns None if the player has no balance yet or a balance of 0, since
+    those aren't on the leaderboard at all."""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT balance FROM currency WHERE user_id = ?", (user_id,))
+    row = cur.fetchone()
+    if not row or row["balance"] <= 0:
+        conn.close()
+        return None
+    cur.execute("SELECT COUNT(*) AS c FROM currency WHERE balance > ?", (row["balance"],))
+    higher = cur.fetchone()["c"]
+    conn.close()
+    return higher + 1
+
+
 def get_top_collectors(limit: int = 50):
     """
     Top `limit` players ranked by how many cards they personally own

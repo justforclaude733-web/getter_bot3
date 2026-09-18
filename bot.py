@@ -553,9 +553,38 @@ async def dart_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
 
+INVENTORY_IMAGE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "inventory.jpg")
+
+
 async def inventory_currency_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    balance = db.get_currency(update.effective_user.id)
-    await update.message.reply_text(f"💰 Balance: {balance} {config.CURRENCY_SYMBOL}")
+    user = update.effective_user
+    balance = db.get_currency(user.id)
+    card_count = len(db.get_user_inventory(user.id, apply_filter=False))
+    rank = db.get_richest_rank(user.id)
+    rank_text = f"#{rank}" if rank else "—"
+    display_name = db.get_display_name(user.id)
+
+    lines = [
+        "╔══════════════════════════╗",
+        f"║       🎒 {_bold_sans('INVENTORY')}       ║",
+        "╚══════════════════════════╝",
+        "",
+        f"       👤 {display_name}",
+        f"       🏆 {_bold_sans('Rank')}  {rank_text}",
+        "",
+        f"       💰 {_bold_sans(f'{balance:,}')} {config.CURRENCY_SYMBOL}",
+        f"          {_bold_sans('BALANCE')}",
+        "",
+        f"       🎴 {_bold_sans(f'{card_count:,}')}",
+        f"          {_bold_sans('CARDS')}",
+    ]
+    text = "\n".join(lines)
+
+    try:
+        with open(INVENTORY_IMAGE_PATH, "rb") as photo:
+            await update.message.reply_photo(photo=photo, caption=text)
+    except FileNotFoundError:
+        await update.message.reply_text(text)
 
 
 # ---------------- /vypay ----------------
