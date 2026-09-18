@@ -57,6 +57,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+FORCE_JOIN_LINK = "https://t.me/+itkOif9ZlFJkYTc0"
+FORCE_JOIN_SETUP_COMMAND = "setforcejoin"
+
 # In-memory store for /send submissions awaiting the owner's decision
 # (add directly, or pick a rarity first). Key -> submission details.
 # Cleared automatically once handled; lost on restart, which just means
@@ -130,6 +133,146 @@ async def send_character_result(context: ContextTypes.DEFAULT_TYPE, chat_id: int
         await context.bot.send_video(chat_id=chat_id, video=file_id, **kwargs)
     else:
         await context.bot.send_photo(chat_id=chat_id, photo=file_id, **kwargs)
+
+
+async def _force_join_required(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Return True when the user is not currently a member of the required group."""
+    user = update.effective_user
+    if user is None or user.is_bot:
+        return False
+
+    settings = db.get_force_join_settings()
+    if not settings:
+        # The owner must run /setforcejoin once inside the target group so the
+        # bot can learn the group's numeric chat ID.
+        return False
+
+    try:
+        member = await context.bot.get_chat_member(settings["chat_id"], user.id)
+        return member.status in ("left", "kicked")
+    except Exception:
+        logger.exception("Force-join membership check failed for user %s", user.id)
+        # Fail closed: if the bot cannot verify membership, do not grant access.
+        return True
+
+
+def _force_join_markup(settings=None):
+    invite_link = (settings["invite_link"] if settings else FORCE_JOIN_LINK) or FORCE_JOIN_LINK
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📢 Join the group", url=invite_link)],
+        [InlineKeyboardButton("✅ I joined — Check", callback_data="forcejoin:check")],
+    ])
+
+
+async def _block_non_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Block bot commands/buttons until the user is currently in the required group."""
+    user = update.effective_user
+    if user is None or user.is_bot:
+        return
+
+    # This setup command is intentionally usable only inside a group, so the
+    # owner can register the target group's numeric chat ID.
+    message = update.effective_message
+    text = (message.text or message.caption or "") if message else ""
+    if text.startswith("/setforcejoin"):
+        return
+
+    # The membership-check button must always be allowed through.
+    if update.callback_query and (update.callback_query.data or "") == "forcejoin:check":
+        return
+
+    if not await _force_join_required(update, context):
+        return
+
+    settings = db.get_force_join_settings()
+    notice = (
+        "🔒 <b>Group membership required</b>\n\n"
+        "Please join the required group first, then tap <b>I joined — Check</b>."
+    )
+    try:
+        if update.callback_query:
+            await update.callback_query.answer("🔒 Please join the required group first.", show_alert=True)
+            # For buttons tapped in a channel post, never post the join prompt
+            # back into the channel. Send it privately to the clicking user.
+            if update.callback_query.message and update.callback_query.message.chat.type == "channel":
+                await context.bot.send_message(
+                    chat_id=user.id,
+                    text=notice,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=_force_join_markup(settings),
+                )
+            else:
+                await update.callback_query.message.reply_text(
+                    notice, parse_mode=ParseMode.HTML, reply_markup=_force_join_markup(settings)
+                )
+        elif update.effective_message:
+            await update.effective_message.reply_text(
+                notice, parse_mode=ParseMode.HTML, reply_markup=_force_join_markup(settings)
+            )
+    except Exception:
+        logger.exception("Failed to send force-join prompt to user %s", user.id)
+    raise ApplicationHandlerStop
+
+
+async def set_force_join_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Register the group where membership is required. Owner-only setup."""
+    user = update.effective_user
+    chat = update.effective_chat
+    if not is_admin(user.id):
+        await update.effective_message.reply_text("⛔ Only the owner can configure the required group.")
+        return
+    if chat is None or chat.type not in ("group", "supergroup"):
+        await update.effective_message.reply_text(
+            "⚠️ Run /setforcejoin inside the required group."
+        )
+        return
+
+    try:
+        me = await context.bot.get_me()
+        bot_member = await context.bot.get_chat_member(chat.id, me.id)
+        if bot_member.status not in ("administrator", "creator"):
+            await update.effective_message.reply_text(
+                "⚠️ Please make the bot an administrator in this group, then run /setforcejoin again."
+            )
+            return
+    except Exception:
+        await update.effective_message.reply_text(
+            "⚠️ I couldn't verify my admin status in this group. Please make me an administrator and try again."
+        )
+        return
+
+    db.set_force_join_settings(chat.id, FORCE_JOIN_LINK)
+    await update.effective_message.reply_text(
+        "✅ Force-join group configured.\n\n"
+        "From now on, users must be members of this group to use the bot, "
+        "and leaving the group will remove their access immediately."
+    )
+
+
+async def force_join_check_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+    settings = db.get_force_join_settings()
+    if not settings:
+        await query.message.reply_text(
+            "⚠️ The required group has not been configured yet. Please contact the owner."
+        )
+        return
+
+    try:
+        member = await context.bot.get_chat_member(settings["chat_id"], user.id)
+        joined = member.status not in ("left", "kicked")
+    except Exception:
+        joined = False
+
+    if joined:
+        await query.message.reply_text("✅ Membership confirmed. You can use the bot now.")
+    else:
+        await query.message.reply_text(
+            "❌ I still can't see you in the required group. Join it first, then check again.",
+            reply_markup=_force_join_markup(settings),
+        )
 
 
 async def _capture_user_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4698,6 +4841,9 @@ def main():
     app = ApplicationBuilder().token(config.BOT_TOKEN).build()
 
     app.add_handler(TypeHandler(Update, _block_banned_users), group=-2)
+    app.add_handler(TypeHandler(Update, _block_non_members), group=-1)
+    app.add_handler(CommandHandler("setforcejoin", set_force_join_command), group=0)
+    app.add_handler(CallbackQueryHandler(force_join_check_callback, pattern=r"^forcejoin:check$"), group=0)
     app.add_handler(TypeHandler(Update, _capture_user_info), group=-1)
 
     app.add_handler(CommandHandler("start", start_command))

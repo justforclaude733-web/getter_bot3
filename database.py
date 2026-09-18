@@ -651,6 +651,17 @@ def init_db():
         cur.execute("ALTER TABLE chat_last_sender ADD COLUMN last_message_at TEXT")
         conn.commit()
 
+    # ---------------- Force-join settings ----------------
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS force_join_settings (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            chat_id INTEGER NOT NULL,
+            invite_link TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    """)
+    conn.commit()
+
     # ---------------- Bans ----------------
     cur.execute("""
         CREATE TABLE IF NOT EXISTS bans (
@@ -662,6 +673,26 @@ def init_db():
     """)
     conn.commit()
 
+    conn.close()
+
+
+# ---------------- Force-join settings ----------------
+
+def get_force_join_settings():
+    conn = get_connection()
+    row = conn.execute("SELECT * FROM force_join_settings WHERE id = 1").fetchone()
+    conn.close()
+    return row
+
+
+def set_force_join_settings(chat_id: int, invite_link: str):
+    conn = get_connection()
+    conn.execute(
+        "INSERT INTO force_join_settings (id, chat_id, invite_link, updated_at) VALUES (1, ?, ?, ?) "
+        "ON CONFLICT(id) DO UPDATE SET chat_id = excluded.chat_id, invite_link = excluded.invite_link, updated_at = excluded.updated_at",
+        (chat_id, invite_link, datetime.utcnow().isoformat()),
+    )
+    conn.commit()
     conn.close()
 
 
