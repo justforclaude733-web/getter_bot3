@@ -11,6 +11,7 @@ Last synced: 2026-09-13 - repo/Railway wiring check.
 
 import asyncio
 import logging
+import math
 import os
 import random
 import re
@@ -3454,6 +3455,39 @@ async def bin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------------- /rarities ----------------
 
+RARITIES_IMAGE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "rarities.jpg")
+
+
+def _bold_sans(text: str) -> str:
+    """Convert plain ASCII letters/digits to Mathematical Sans-Bold unicode
+    characters. Non-ASCII characters (emoji, etc.) are left untouched."""
+    out = []
+    for ch in text:
+        if 'A' <= ch <= 'Z':
+            out.append(chr(ord(ch) - ord('A') + 0x1D5D4))
+        elif 'a' <= ch <= 'z':
+            out.append(chr(ord(ch) - ord('a') + 0x1D5EE))
+        elif '0' <= ch <= '9':
+            out.append(chr(ord(ch) - ord('0') + 0x1D7EC))
+        else:
+            out.append(ch)
+    return ''.join(out)
+
+
+def _rarity_bar(owned: int, total: int):
+    """Build a 10-diamond progress bar. Returns (bar, percent), or None if
+    the rarity has no cards at all (total == 0)."""
+    if total == 0:
+        return None
+    raw_percent = (owned / total) * 100
+    percent = min(int(math.ceil(raw_percent / 5) * 5), 100)  # round UP to nearest 5%
+    full = percent // 10
+    half = 1 if percent % 10 else 0
+    empty = 10 - full - half
+    bar = "◆" * full + "◈" * half + "◇" * empty
+    return bar, percent
+
+
 async def rarities_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rarities = sorted(db.list_rarities(), key=lambda r: r["weight"])
     if not rarities:
@@ -3461,17 +3495,41 @@ async def rarities_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     user_id = update.effective_user.id
-    show_weight = is_admin(user_id)
-    lines = ["🎖 <b>Rarities</b>\n"]
+
+    lines = [
+        f"🎖 ✦  {_bold_sans('RARITIES')}  ✦",
+        "Your Collection Progress",
+        "╰─────────────── ✦ ───────────────╯",
+        "",
+    ]
+
     for r in rarities:
         total = db.count_characters_by_rarity(r["id"])
         owned = db.count_user_owned_by_rarity(user_id, r["id"])
-        if show_weight:
-            lines.append(f"{r['name']} — weight {r['weight']} ({owned}/{total})")
-        else:
-            lines.append(f"{r['name']} — ({owned}/{total})")
 
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+        lines.append(_bold_sans(r["name"]))
+        result = _rarity_bar(owned, total)
+        if result is None:
+            lines.append("—")
+        else:
+            bar, percent = result
+            lines.append(f"{bar}  {percent}%")
+            lines.append(f"{owned} / {total}")
+        lines.append("")
+
+    text = "\n".join(lines).rstrip()
+
+    # Telegram photo captions are capped at 1024 characters; if the rarity
+    # list ever grows past that, send the image and text as two messages.
+    try:
+        with open(RARITIES_IMAGE_PATH, "rb") as photo:
+            if len(text) <= 1024:
+                await update.message.reply_photo(photo=photo, caption=text)
+            else:
+                await update.message.reply_photo(photo=photo)
+                await update.message.reply_text(text)
+    except FileNotFoundError:
+        await update.message.reply_text(text)
 
 
 # ---------------- /prices (dynamic rarity economy) ----------------
