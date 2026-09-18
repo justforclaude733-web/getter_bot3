@@ -170,15 +170,20 @@ async def _block_non_members(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if user is None or user.is_bot:
         return
 
-    # This setup command is intentionally usable only inside a group, so the
-    # owner can register the target group's numeric chat ID.
+    # Force-join must only run for commands and callback buttons.
+    # Normal messages must never receive a membership warning.
     message = update.effective_message
     text = (message.text or message.caption or "") if message else ""
+    is_command = bool(message and text.startswith("/"))
+    is_callback = update.callback_query is not None
+
+    # The setup command and membership-check button must always be allowed through.
     if text.startswith("/setforcejoin"):
         return
-
-    # The membership-check button must always be allowed through.
     if update.callback_query and (update.callback_query.data or "") == "forcejoin:check":
+        return
+
+    if not (is_command or is_callback):
         return
 
     if not await _force_join_required(update, context):
