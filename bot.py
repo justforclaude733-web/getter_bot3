@@ -1039,6 +1039,88 @@ async def give_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# ---------------- /top (public leaderboards) ----------------
+
+def _top_keyboard():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("💎 VɎ", callback_data="top:vy"),
+            InlineKeyboardButton("🎴 Collection", callback_data="top:collection"),
+        ]
+    ])
+
+
+def _format_top_name(user_id: int) -> str:
+    """Best available, HTML-safe player name for a leaderboard row."""
+    name = html.escape(db.get_display_name(user_id))
+    if len(name) > 28:
+        name = name[:25] + "..."
+    return name
+
+
+def _build_top_text(mode: str) -> str:
+    if mode == "vy":
+        rows = db.get_richest_users(limit=10)
+        title = "💎 𝗧𝗢𝗣 𝟭𝟬 — 𝗩Ɏ"
+        if not rows:
+            return f"╔══════════════════════════╗\n║     {title}     ║\n╚══════════════════════════╝\n\nNo players have VɎ yet."
+        lines = [f"╔══════════════════════════╗", f"║     {title}     ║", "╚══════════════════════════╝", ""]
+        for rank, row in enumerate(rows, 1):
+            lines.append(f"{rank:>2}. {_format_top_name(row['user_id'])} — <b>{row['balance']:,} VɎ</b>")
+        return "\n".join(lines)
+
+    rows = db.get_top_collectors(limit=10)
+    title = "🎴 𝗧𝗢𝗣 𝟭𝟬 — 𝗖𝗢𝗟𝗟𝗘𝗖𝗧𝗜𝗢𝗡"
+    if not rows:
+        return f"╔══════════════════════════╗\n║ {title} ║\n╚══════════════════════════╝\n\nNo cards have been collected yet."
+    lines = ["╔══════════════════════════╗", f"║ {title} ║", "╚══════════════════════════╝", ""]
+    for rank, row in enumerate(rows, 1):
+        count = row["card_count"]
+        card_word = "card" if count == 1 else "cards"
+        lines.append(f"{rank:>2}. {_format_top_name(row['user_id'])} — <b>{count:,} {card_word}</b>")
+    return "\n".join(lines)
+
+
+async def top_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    mode = context.args[0].lower() if context.args else None
+
+    if mode not in (None, "vy", "collection"):
+        await update.message.reply_text(
+            "⚠️ Usage: <code>/top</code>, <code>/top vy</code> or <code>/top collection</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if mode is None:
+        await update.message.reply_text(
+            "🏆 <b>Choose a leaderboard:</b>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=_top_keyboard(),
+        )
+        return
+
+    await update.message.reply_text(
+        _build_top_text(mode),
+        parse_mode=ParseMode.HTML,
+        reply_markup=_top_keyboard(),
+    )
+
+
+async def top_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    mode = query.data.split(":", 1)[1]
+    if mode not in ("vy", "collection"):
+        return
+
+    await query.edit_message_text(
+        _build_top_text(mode),
+        parse_mode=ParseMode.HTML,
+        reply_markup=_top_keyboard(),
+    )
+
+
 # ---------------- /player (owner: manage a player's account) ----------------
 
 def _player_menu_keyboard():
@@ -1057,10 +1139,46 @@ async def player_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔ You're not allowed to use this command.")
         return
 
+    # /player can now take either a numeric Telegram ID or a username
+    # directly. Keeping the old prompt when no argument is supplied means
+    # the interactive flow still works exactly as before.
+    if context.args:
+        value = context.args[0].strip()
+        target_id = None
+
+        if value.lstrip("+").isdigit():
+            try:
+                target_id = int(value)
+            except ValueError:
+                target_id = None
+        else:
+            target_id = db.get_user_id_by_username(value.lstrip("@"))
+
+        if not target_id:
+            label = value if value.startswith("@") else f"@{value}"
+            await update.message.reply_text(
+                f"❓ No player found for <code>{label}</code>.\n"
+                "Use a valid Telegram numeric ID or username.\n"
+                "The player must have interacted with the bot before when using a username.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        context.user_data.pop("player_awaiting_username", None)
+        context.user_data.pop("player_awaiting_action", None)
+        context.user_data["player_target_id"] = target_id
+        display_name = db.get_display_name(target_id)
+        await update.message.reply_text(
+            f"👤 Managing <b>{display_name}</b> (<code>{target_id}</code>). What would you like to do?",
+            parse_mode=ParseMode.HTML,
+            reply_markup=_player_menu_keyboard(),
+        )
+        return
+
     context.user_data["player_awaiting_username"] = True
     context.user_data.pop("player_target_id", None)
     context.user_data.pop("player_awaiting_action", None)
-    await update.message.reply_text("✏️ Send the player's @username:")
+    await update.message.reply_text("✏️ Send the player's @username or numeric Telegram ID:")
 
 
 async def player_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1103,14 +1221,22 @@ async def capture_player_input(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     if context.user_data.get("player_awaiting_username"):
-        username = text.lstrip("@")
-        target_id = db.get_user_id_by_username(username)
+        value = text.strip()
+        target_id = None
+
+        if value.lstrip("+").isdigit():
+            try:
+                target_id = int(value)
+            except ValueError:
+                target_id = None
+        else:
+            target_id = db.get_user_id_by_username(value.lstrip("@"))
+
         if not target_id:
             await update.message.reply_text(
-                f"❓ No player found with username @{username}. "
-                "They need to have used the bot at least once. Send /player to try again."
+                "❓ No player found. Send a valid numeric Telegram ID or @username. "
+                "For usernames, the player needs to have interacted with the bot at least once."
             )
-            context.user_data.pop("player_awaiting_username", None)
             return
 
         context.user_data.pop("player_awaiting_username", None)
@@ -5028,6 +5154,8 @@ def main():
     app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(CallbackQueryHandler(stats_callback, pattern=r"^stats:"))
     app.add_handler(CommandHandler("give", give_command))
+    app.add_handler(CommandHandler("top", top_command))
+    app.add_handler(CallbackQueryHandler(top_callback, pattern=r"^top:"))
     app.add_handler(CommandHandler("player", player_command))
     app.add_handler(CallbackQueryHandler(player_menu_callback, pattern=r"^padmin:"))
     app.add_handler(CommandHandler("ban", ban_command))
