@@ -10,6 +10,7 @@ Last synced: 2026-09-13 - repo/Railway wiring check.
 """
 
 import asyncio
+from contextvars import ContextVar
 import html
 import logging
 import math
@@ -25,6 +26,7 @@ from datetime import datetime
 
 from telegram import (
     Update,
+    Bot,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InputMediaPhoto,
@@ -81,6 +83,84 @@ PENDING_FILE_RESTORE = set()
 # persisted in SQLite; only the admin's unfinished composition lives here.
 PENDING_NEW_FLOWS = {}
 NEW_AI_CLIENT = AIClient(config)
+
+# User who owns the currently processed update. This is used to bind
+# callback buttons on bot-generated messages to the user who triggered them.
+_CURRENT_UPDATE_USER_ID = ContextVar("current_update_user_id", default=None)
+_PERSONAL_BUTTON_GUARD_INSTALLED = False
+
+
+def _markup_has_callback_buttons(reply_markup) -> bool:
+    if not reply_markup or not getattr(reply_markup, "inline_keyboard", None):
+        return False
+    return any(
+        getattr(button, "callback_data", None) is not None
+        for row in reply_markup.inline_keyboard
+        for button in row
+    )
+
+
+def _install_personal_button_guard():
+    """Persist ownership for every callback-button message sent by the bot."""
+    global _PERSONAL_BUTTON_GUARD_INSTALLED
+    if _PERSONAL_BUTTON_GUARD_INSTALLED:
+        return
+
+    async def _send_and_record(original, bot_self, *args, **kwargs):
+        reply_markup = kwargs.get("reply_markup")
+        result = await original(bot_self, *args, **kwargs)
+        owner_id = _CURRENT_UPDATE_USER_ID.get()
+        if owner_id and _markup_has_callback_buttons(reply_markup) and result is not None:
+            chat_id = getattr(getattr(result, "chat", None), "id", None)
+            message_id = getattr(result, "message_id", None)
+            if chat_id is not None and message_id is not None:
+                try:
+                    db.set_personalized_button_owner(chat_id, message_id, owner_id)
+                except Exception:
+                    logger.exception("Failed to save personalized button owner")
+        return result
+
+    for method_name in ("send_message", "send_photo", "send_video", "send_animation", "send_document"):
+        original = getattr(Bot, method_name)
+
+        async def wrapped(bot_self, *args, _original=original, **kwargs):
+            return await _send_and_record(_original, bot_self, *args, **kwargs)
+
+        setattr(Bot, method_name, wrapped)
+
+    _PERSONAL_BUTTON_GUARD_INSTALLED = True
+
+
+async def _block_unowned_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Allow a callback button only to the user who triggered its bot message."""
+    query = update.callback_query
+    if query is None or query.from_user is None:
+        return
+
+    # The force-join check is intentionally public so users can verify membership.
+    if (query.data or "").startswith("forcejoin:check:"):
+        try:
+            target_id = int((query.data or "").split(":", 2)[2])
+        except (ValueError, IndexError):
+            await query.answer("⚠️ Invalid button.", show_alert=True)
+            raise ApplicationHandlerStop
+        if query.from_user.id != target_id:
+            await query.answer("⛔ This button belongs to another user.", show_alert=True)
+            raise ApplicationHandlerStop
+        return
+
+    message = query.message
+    if message is None:
+        return
+
+    owner_id = db.get_personalized_button_owner(message.chat.id, message.message_id)
+    if owner_id is None:
+        # Old/external messages without a registered owner are left alone.
+        return
+
+    if query.from_user.id != owner_id:
+        await query.answer("⛔ This button belongs to another user.", show_alert=True)
+        raise ApplicationHandlerStop
 
 
 # ---------------- Helpers ----------------
@@ -156,11 +236,12 @@ async def _force_join_required(update: Update, context: ContextTypes.DEFAULT_TYP
         return True
 
 
-def _force_join_markup(settings=None):
+def _force_join_markup(settings=None, user_id=None):
     invite_link = (settings["invite_link"] if settings else FORCE_JOIN_LINK) or FORCE_JOIN_LINK
+    target_user_id = int(user_id or 0)
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📢 Join the group", url=invite_link)],
-        [InlineKeyboardButton("✅ I joined — Check", callback_data="forcejoin:check")],
+        [InlineKeyboardButton("✅ I joined — Check", callback_data=f"forcejoin:check:{target_user_id}")],
     ])
 
 
@@ -180,7 +261,7 @@ async def _block_non_members(update: Update, context: ContextTypes.DEFAULT_TYPE)
     # The setup command and membership-check button must always be allowed through.
     if text.startswith("/setforcejoin"):
         return
-    if update.callback_query and (update.callback_query.data or "") == "forcejoin:check":
+    if update.callback_query and (update.callback_query.data or "").startswith("forcejoin:check:"):
         return
 
     if not (is_command or is_callback):
@@ -204,7 +285,7 @@ async def _block_non_members(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     chat_id=user.id,
                     text=notice,
                     parse_mode=ParseMode.HTML,
-                    reply_markup=_force_join_markup(settings),
+                    reply_markup=_force_join_markup(settings, user.id),
                 )
             else:
                 await update.callback_query.message.reply_text(
@@ -290,11 +371,12 @@ async def force_join_check_callback(update: Update, context: ContextTypes.DEFAUL
     else:
         await query.message.reply_text(
             "❌ I still can't see you in the required group. Join it first, then check again.",
-            reply_markup=_force_join_markup(settings),
+            reply_markup=_force_join_markup(settings, user.id),
         )
 
 
 async def _capture_user_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    _CURRENT_UPDATE_USER_ID.set(update.effective_user.id if update.effective_user else None)
     """
     Runs first, ahead of every other handler, for every incoming update.
     Only counts someone as a "real" user of the bot - and refreshes their
@@ -4858,12 +4940,14 @@ def main():
     threading.Thread(target=memories.run_nightly_engagement_loop, daemon=True).start()
 
     app = ApplicationBuilder().token(config.BOT_TOKEN).build()
+    _install_personal_button_guard()
 
     app.add_handler(TypeHandler(Update, _block_banned_users), group=-2)
     app.add_handler(TypeHandler(Update, _block_non_members), group=-1)
     app.add_handler(CommandHandler("setforcejoin", set_force_join_command), group=0)
-    app.add_handler(CallbackQueryHandler(force_join_check_callback, pattern=r"^forcejoin:check$"), group=0)
+    app.add_handler(CallbackQueryHandler(force_join_check_callback, pattern=r"^forcejoin:check:\d+$"), group=0)
     app.add_handler(TypeHandler(Update, _capture_user_info), group=-1)
+    app.add_handler(TypeHandler(Update, _block_unowned_callbacks), group=-1)
 
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("invite", invite_command))

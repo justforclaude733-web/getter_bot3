@@ -662,7 +662,43 @@ def init_db():
     """)
     conn.commit()
 
-    # ---------------- Bans ----------------
+    # ---------------- Personalized callback buttons ----------------
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS personalized_buttons (
+            chat_id INTEGER NOT NULL,
+            message_id INTEGER NOT NULL,
+            owner_user_id INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (chat_id, message_id)
+        )
+    """)
+    conn.commit()
+
+    # ---------------- Personalized callback buttons ----------------
+
+def set_personalized_button_owner(chat_id: int, message_id: int, owner_user_id: int):
+    conn = get_connection()
+    conn.execute(
+        """INSERT INTO personalized_buttons (chat_id, message_id, owner_user_id, created_at)
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT(chat_id, message_id) DO UPDATE SET
+               owner_user_id=excluded.owner_user_id, created_at=excluded.created_at""",
+        (chat_id, message_id, owner_user_id, datetime.utcnow().isoformat()),
+    )
+    conn.commit()
+    conn.close()
+
+def get_personalized_button_owner(chat_id: int, message_id: int):
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT owner_user_id FROM personalized_buttons WHERE chat_id = ? AND message_id = ?",
+        (chat_id, message_id),
+    ).fetchone()
+    conn.close()
+    return int(row["owner_user_id"]) if row else None
+
+
+# ---------------- Bans ----------------
     cur.execute("""
         CREATE TABLE IF NOT EXISTS bans (
             user_id INTEGER PRIMARY KEY,
