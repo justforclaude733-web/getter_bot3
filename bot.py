@@ -2960,25 +2960,25 @@ def _new_builder_keyboard(flow_id: str):
     for i, button in enumerate(flow["buttons"]):
         rows.append([InlineKeyboardButton(f"✏️ {button['label']}", callback_data=f"new:remove:{flow_id}:{i}")])
     rows.append([
-        InlineKeyboardButton("📤 ارسال مستقیم", callback_data=f"new:publish:{flow_id}"),
-        InlineKeyboardButton("➕ افزودن دکمه", callback_data=f"new:add:{flow_id}"),
+        InlineKeyboardButton("📤 Publish directly", callback_data=f"new:publish:{flow_id}"),
+        InlineKeyboardButton("➕ Add button", callback_data=f"new:add:{flow_id}"),
     ])
     return InlineKeyboardMarkup(rows)
 
 
 def _new_action_keyboard(flow_id: str):
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔗 باز کردن یک لینک", callback_data=f"new:action:{flow_id}:url")],
-        [InlineKeyboardButton("🎴 گرفتن یک کارت", callback_data=f"new:action:{flow_id}:card")],
-        [InlineKeyboardButton("💎 گرفتن VɎ", callback_data=f"new:action:{flow_id}:vy")],
-        [InlineKeyboardButton("📱 باز کردن مینی اپ", callback_data=f"new:action:{flow_id}:miniapp")],
-        [InlineKeyboardButton("◀️ لغو", callback_data=f"new:cancel:{flow_id}")],
+        [InlineKeyboardButton("🔗 Open a link", callback_data=f"new:action:{flow_id}:url")],
+        [InlineKeyboardButton("🎴 Get a card", callback_data=f"new:action:{flow_id}:card")],
+        [InlineKeyboardButton("💎 Get VɎ", callback_data=f"new:action:{flow_id}:vy")],
+        [InlineKeyboardButton("📱 Open Mini App", callback_data=f"new:action:{flow_id}:miniapp")],
+        [InlineKeyboardButton("◀️ Cancel", callback_data=f"new:cancel:{flow_id}")],
     ])
 
 
 def _new_preview_text(flow):
-    extra = "\n\nدکمه‌های اضافه‌شده: " + ", ".join(html.escape(b["label"]) for b in flow["buttons"]) if flow["buttons"] else ""
-    return f"📩 <b>پیام دریافت شد</b>\n\n{html.escape(flow['fa_text'] or '')}" + extra
+    extra = "\n\nAdded buttons: " + ", ".join(html.escape(b["label"]) for b in flow["buttons"]) if flow["buttons"] else ""
+    return f"📩 <b>Message received</b>\n\n{html.escape(flow['fa_text'] or '')}" + extra
 
 
 async def _translate_new_text(text: str, target_language: str) -> str:
@@ -3040,7 +3040,7 @@ async def new_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     existing_flow = await _new_flow_id_for_user(user.id)
     if existing_flow:
-        await update.message.reply_text("⚠️ یک ساخت پیام هنوز بازه. اول همون رو ارسال یا لغو کن.")
+        await update.message.reply_text("⚠️ A message draft is already open. Publish or cancel it first.")
         return
 
     setting = db.get_new_channel_setting()
@@ -3063,7 +3063,7 @@ async def new_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "buttons": [],
                 "button_draft": None,
             }
-            await update.message.reply_text("⚠️ لینک قبلی چنل قابل دسترسی نیست.\n\n🔗 لینک چنل جدید رو بفرستید")
+            await update.message.reply_text("⚠️ The previous channel is no longer accessible.\n\n🔗 Send a new channel link.")
             return
 
         flow_id = uuid.uuid4().hex[:10]
@@ -3077,7 +3077,7 @@ async def new_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "buttons": [],
             "button_draft": None,
         }
-        await update.message.reply_text("📝 متن پیامتون رو بنویسید")
+        await update.message.reply_text("📝 Send the message text.")
         return
 
     flow_id = uuid.uuid4().hex[:10]
@@ -3091,21 +3091,21 @@ async def new_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "buttons": [],
         "button_draft": None,
     }
-    await update.message.reply_text("🔗 لینک چنل رو بفرستید")
+    await update.message.reply_text("🔗 Send the channel link.")
 
 
 async def _publish_new_flow(flow_id: str, context: ContextTypes.DEFAULT_TYPE, query=None):
     flow = PENDING_NEW_FLOWS.get(flow_id)
     if not flow:
         if query:
-            await query.answer("⚠️ این پیام منقضی شده؛ دوباره /new رو بزنید.", show_alert=True)
+            await query.answer("⚠️ This draft has expired. Run /new again.", show_alert=True)
         return
 
     fa_text = flow.get("fa_text") or ""
     en_text = flow.get("en_text") or ""
     if not fa_text or not en_text:
         if query:
-            await query.answer("⚠️ متن فارسی و انگلیسی کامل نیست.", show_alert=True)
+            await query.answer("⚠️ Both Persian and English texts are required.", show_alert=True)
         return
 
     # Reserve the DB post first so all callback IDs can be created before the
@@ -3127,17 +3127,17 @@ async def _publish_new_flow(flow_id: str, context: ContextTypes.DEFAULT_TYPE, qu
         db.delete_new_post(post_id)
         flow["stage"] = "channel"
         if query:
-            await query.answer("⚠️ لینک چنل معتبر نیست یا بات دسترسی ارسال نداره.", show_alert=True)
-            await query.message.reply_text("🔗 لینک چنل جدید رو بفرستید")
+            await query.answer("⚠️ The channel link is invalid or the bot cannot post there.", show_alert=True)
+            await query.message.reply_text("🔗 Send a new channel link.")
         return
 
     db.update_new_post_message_id(post_id, sent.message_id)
     db.set_new_channel_setting(flow["channel_target"], flow["channel_link"])
     del PENDING_NEW_FLOWS[flow_id]
     if query:
-        await query.answer("✅ پیام ارسال شد")
+        await query.answer("✅ Message published.")
         try:
-            await query.edit_message_text("✅ پیام با موفقیت در چنل منتشر شد.")
+            await query.edit_message_text("✅ Message published successfully to the channel.")
         except Exception:
             pass
 
@@ -3155,18 +3155,18 @@ async def new_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 post_id = int(data[2])
                 target = data[3]
             except (ValueError, IndexError):
-                await query.answer("⚠️ دکمه نامعتبره.", show_alert=True)
+                await query.answer("⚠️ Invalid button.", show_alert=True)
                 return
             if target not in {"fa", "en"}:
-                await query.answer("⚠️ زبان نامعتبره.", show_alert=True)
+                await query.answer("⚠️ Invalid language.", show_alert=True)
                 return
             post = db.get_new_post(post_id)
             if not post:
-                await query.answer("⚠️ این پیام پیدا نشد.", show_alert=True)
+                await query.answer("⚠️ This message was not found.", show_alert=True)
                 return
             buttons = db.get_new_post_buttons(post_id)
             rows = [[InlineKeyboardButton(
-                "🇮🇷 فارسی" if target == "en" else "🇬🇧 English",
+                "🇮🇷 Persian" if target == "en" else "🇬🇧 English",
                 callback_data=f"new:lang:{post_id}:{'fa' if target == 'en' else 'en'}",
             )]]
             for b in buttons:
@@ -3186,7 +3186,7 @@ async def new_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             button_id = int(data[2])
         except (ValueError, IndexError):
-            await query.answer("⚠️ دکمه نامعتبره.", show_alert=True)
+            await query.answer("⚠️ Invalid button.", show_alert=True)
             return
 
         button_info = db.get_new_post_button(button_id)
@@ -3200,10 +3200,10 @@ async def new_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 button_id, user.id, user.username or user.first_name
             )
             if result["status"] == "exhausted":
-                await query.answer("⛔ ظرفیت استفاده از این دکمه تمام شده.", show_alert=True)
+                await query.answer("⛔ This button has reached its usage limit.", show_alert=True)
                 return
             if result["status"] != "ok":
-                await query.answer("⚠️ این کارت دیگر در دسترس نیست.", show_alert=True)
+                await query.answer("⚠️ This card is no longer available.", show_alert=True)
                 return
             character = db.get_character(result["character_id"])
             if character:
@@ -3211,31 +3211,31 @@ async def new_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     memories.record_acquisition(user.id, character, "get")
                 except Exception:
                     logger.exception("Failed to record /new card acquisition")
-                await query.answer(f"🎴 {character['name']} دریافت شد!", show_alert=True)
+                await query.answer(f"🎴 {character['name']} received!", show_alert=True)
             else:
-                await query.answer("🎴 کارت دریافت شد!", show_alert=True)
+                await query.answer("🎴 Card received!", show_alert=True)
             return
 
         if action_type == "vy":
             try:
                 amount = int(button_info["action_data"])
             except (TypeError, ValueError):
-                await query.answer("⚠️ مقدار VɎ نامعتبر است.", show_alert=True)
+                await query.answer("⚠️ Invalid VɎ amount.", show_alert=True)
                 return
             if amount <= 0:
-                await query.answer("⚠️ مقدار VɎ نامعتبر است.", show_alert=True)
+                await query.answer("⚠️ Invalid VɎ amount.", show_alert=True)
                 return
             result = db.claim_new_vy_button(button_id, user.id, amount)
             if result["status"] == "exhausted":
-                await query.answer("⛔ ظرفیت استفاده از این دکمه تمام شده.", show_alert=True)
+                await query.answer("⛔ This button has reached its usage limit.", show_alert=True)
                 return
             if result["status"] != "ok":
-                await query.answer("⚠️ دریافت VɎ انجام نشد.", show_alert=True)
+                await query.answer("⚠️ VɎ could not be claimed.", show_alert=True)
                 return
-            await query.answer(f"💎 {amount:,} VɎ دریافت کردی! موجودی: {result['balance']:,} VɎ", show_alert=True)
+            await query.answer(f"💎 You received {amount:,} VɎ! Balance: {result['balance']:,} VɎ", show_alert=True)
             return
 
-        await query.answer("⚠️ نوع دکمه پشتیبانی نمی‌شود.", show_alert=True)
+        await query.answer("⚠️ This button type is not supported.", show_alert=True)
         return
 
     if not is_admin(user.id):
@@ -3245,7 +3245,7 @@ async def new_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     flow_id = data[2]
     flow = PENDING_NEW_FLOWS.get(flow_id)
     if not flow:
-        await query.answer("⚠️ این ساخت‌پیام منقضی شده؛ دوباره /new رو بزنید.", show_alert=True)
+        await query.answer("⚠️ This message draft has expired. Run /new again.", show_alert=True)
         return
 
     if action == "publish":
@@ -3253,20 +3253,20 @@ async def new_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if action == "cancel":
         del PENDING_NEW_FLOWS[flow_id]
-        await query.answer("لغو شد")
-        await query.edit_message_text("❌ ساخت پیام لغو شد.")
+        await query.answer("Canceled.")
+        await query.edit_message_text("❌ ساخت پیام Canceled..")
         return
     if action == "add":
         flow["stage"] = "button_name"
         flow["button_draft"] = {}
         await query.answer()
-        await query.message.reply_text("🔘 اسم دکمه چیه؟")
+        await query.message.reply_text("🔘 What should the button be called?")
         return
     if action == "remove":
         idx = int(data[3])
         if 0 <= idx < len(flow["buttons"]):
             flow["buttons"].pop(idx)
-        await query.answer("حذف شد")
+        await query.answer("Removed.")
         await query.edit_message_text(
             _new_preview_text(flow), parse_mode=ParseMode.HTML,
             reply_markup=_new_builder_keyboard(flow_id)
@@ -3280,25 +3280,25 @@ async def new_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if kind == "url":
             flow["stage"] = "button_url"
             await query.answer()
-            await query.message.reply_text("🔗 لینکو بفرست")
+            await query.message.reply_text("🔗 Send the link.")
         elif kind == "card":
             flow["stage"] = "button_card_id"
             await query.answer()
-            await query.message.reply_text("🎴 آیدی کارتو بفرست")
+            await query.message.reply_text("🎴 Send the card ID.")
         elif kind == "vy":
             flow["stage"] = "button_vy_amount"
             await query.answer()
-            await query.message.reply_text("💎 مقدار VɎ رو بنویس")
+            await query.message.reply_text("💎 Enter the VɎ amount.")
         elif kind == "miniapp":
             miniapp_url = (config.MINI_APP_URL or "").strip()
             parsed = urlparse(miniapp_url) if miniapp_url else None
             if not miniapp_url or not parsed or parsed.scheme not in {"http", "https"} or not parsed.netloc:
-                await query.answer("⚠️ آدرس Mini App در config.MINI_APP_URL معتبر نیست.", show_alert=True)
+                await query.answer("⚠️ The Mini App URL in config.MINI_APP_URL is invalid.", show_alert=True)
                 return
             flow["buttons"].append({**draft, "action_data": miniapp_url, "max_uses": None})
             flow["stage"] = "preview"
             flow["button_draft"] = None
-            await query.answer("✅ دکمه اضافه شد")
+            await query.answer("✅ Button added.")
             await query.message.reply_text(
                 _new_preview_text(flow), parse_mode=ParseMode.HTML,
                 reply_markup=_new_builder_keyboard(flow_id)
@@ -3321,107 +3321,107 @@ async def capture_new_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if stage == "channel":
         target = _new_channel_target_from_link(text)
         if not target:
-            await update.message.reply_text("⚠️ لینک چنل معتبر نیست. لینک عمومی/خصوصی t.me یا @username رو بفرستید.")
+            await update.message.reply_text("⚠️ Invalid channel link. Send a public/private t.me link or @username.")
             raise ApplicationHandlerStop
         try:
             await context.bot.get_chat(target)
         except Exception:
-            await update.message.reply_text("⚠️ نتونستم به این چنل دسترسی پیدا کنم. مطمئن شو بات ادمین چنله و لینک درست هست.")
+            await update.message.reply_text("⚠️ I could not access this channel. Make sure the bot is an admin and the link is correct.")
             raise ApplicationHandlerStop
         flow["channel_target"] = target
         flow["channel_link"] = text
         flow["stage"] = "fa"
-        await update.message.reply_text("📝 متن پیامتون رو بنویسید")
+        await update.message.reply_text("📝 Send the message text.")
     elif stage == "fa":
         if not text:
-            await update.message.reply_text("⚠️ متن فارسی نمی‌تونه خالی باشه.")
+            await update.message.reply_text("⚠️ The Persian text cannot be empty.")
             raise ApplicationHandlerStop
         if len(text) > 4096:
-            await update.message.reply_text("⚠️ متن فارسی نباید بیشتر از 4096 کاراکتر باشه.")
+            await update.message.reply_text("⚠️ The Persian text cannot exceed 4096 characters.")
             raise ApplicationHandlerStop
         flow["fa_text"] = text
         flow["stage"] = "en"
-        await update.message.reply_text("🇬🇧 متن پیامتون رو به انگلیسی بنویسید")
+        await update.message.reply_text("🇬🇧 Send the English version of the message.")
     elif stage == "en":
         if not text:
-            await update.message.reply_text("⚠️ متن انگلیسی نمی‌تونه خالی باشه.")
+            await update.message.reply_text("⚠️ The English text cannot be empty.")
             raise ApplicationHandlerStop
         if len(text) > 4096:
-            await update.message.reply_text("⚠️ متن انگلیسی نباید بیشتر از 4096 کاراکتر باشه.")
+            await update.message.reply_text("⚠️ The English text cannot exceed 4096 characters.")
             raise ApplicationHandlerStop
         flow["en_text"] = text
         flow["stage"] = "preview"
-        await update.message.reply_text("📩 پیام دریافت شد", reply_markup=_new_builder_keyboard(flow_id))
+        await update.message.reply_text("📩 Message received", reply_markup=_new_builder_keyboard(flow_id))
     elif stage == "button_name":
         if not text or len(text) > 64:
-            await update.message.reply_text("⚠️ اسم دکمه باید بین 1 تا 64 کاراکتر باشه.")
+            await update.message.reply_text("⚠️ The button name must be 1–64 characters.")
             raise ApplicationHandlerStop
         flow["button_draft"] = {"label": text}
         flow["stage"] = "button_action"
-        await update.message.reply_text("⚙️ انتخاب کن این دکمه چیکار میکنه", reply_markup=_new_action_keyboard(flow_id))
+        await update.message.reply_text("⚙️ Choose what this button does.", reply_markup=_new_action_keyboard(flow_id))
     elif stage == "button_url":
         parsed = urlparse(text if "://" in text else "https://" + text)
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-            await update.message.reply_text("⚠️ لینک معتبر بفرست")
+            await update.message.reply_text("⚠️ Send a valid link.")
             raise ApplicationHandlerStop
         if len(text) > 2048:
-            await update.message.reply_text("⚠️ لینک خیلی طولانیه.")
+            await update.message.reply_text("⚠️ The link is too long.")
             raise ApplicationHandlerStop
         flow["button_draft"]["action_data"] = text if "://" in text else "https://" + text
         flow["buttons"].append({**flow["button_draft"], "max_uses": None})
         flow["button_draft"] = None
         flow["stage"] = "preview"
-        await update.message.reply_text("✅ دکمه اضافه شد", reply_markup=_new_builder_keyboard(flow_id))
+        await update.message.reply_text("✅ Button added.", reply_markup=_new_builder_keyboard(flow_id))
     elif stage == "button_card_id":
         try:
             char_id = int(text)
         except ValueError:
-            await update.message.reply_text("⚠️ آیدی کارت باید عدد باشه")
+            await update.message.reply_text("⚠️ The card ID must be a number.")
             raise ApplicationHandlerStop
         if not db.get_character(char_id):
-            await update.message.reply_text("⚠️ کارتی با این آیدی پیدا نشد")
+            await update.message.reply_text("⚠️ No card was found with this ID.")
             raise ApplicationHandlerStop
         flow["button_draft"]["action_data"] = str(char_id)
         flow["stage"] = "button_card_uses"
-        await update.message.reply_text("🔢 این دکمه چند بار قابل استفاده باشه؟")
+        await update.message.reply_text("🔢 How many times can this button be used?")
     elif stage == "button_card_uses":
         try:
             uses = int(text)
         except ValueError:
-            await update.message.reply_text("⚠️ تعداد استفاده باید عدد باشه")
+            await update.message.reply_text("⚠️ The usage limit must be a number.")
             raise ApplicationHandlerStop
         if uses <= 0:
-            await update.message.reply_text("⚠️ تعداد استفاده باید بیشتر از صفر باشه")
+            await update.message.reply_text("⚠️ The usage limit must be greater than zero.")
             raise ApplicationHandlerStop
         flow["buttons"].append({**flow["button_draft"], "max_uses": uses})
         flow["button_draft"] = None
         flow["stage"] = "preview"
-        await update.message.reply_text("✅ دکمه اضافه شد", reply_markup=_new_builder_keyboard(flow_id))
+        await update.message.reply_text("✅ Button added.", reply_markup=_new_builder_keyboard(flow_id))
     elif stage == "button_vy_amount":
         try:
             amount = int(text)
         except ValueError:
-            await update.message.reply_text("⚠️ مقدار VɎ باید عدد باشه")
+            await update.message.reply_text("⚠️ The VɎ amount must be a number.")
             raise ApplicationHandlerStop
         if amount <= 0:
-            await update.message.reply_text("⚠️ مقدار باید بیشتر از صفر باشه")
+            await update.message.reply_text("⚠️ The amount must be greater than zero.")
             raise ApplicationHandlerStop
         flow["button_draft"]["action_data"] = str(amount)
         flow["stage"] = "button_vy_uses"
-        await update.message.reply_text("🔢 این دکمه چند بار قابل استفاده باشه؟")
+        await update.message.reply_text("🔢 How many times can this button be used?")
     elif stage == "button_vy_uses":
         try:
             uses = int(text)
         except ValueError:
-            await update.message.reply_text("⚠️ تعداد استفاده باید عدد باشه")
+            await update.message.reply_text("⚠️ The usage limit must be a number.")
             raise ApplicationHandlerStop
         if uses <= 0:
-            await update.message.reply_text("⚠️ تعداد استفاده باید بیشتر از صفر باشه")
+            await update.message.reply_text("⚠️ The usage limit must be greater than zero.")
             raise ApplicationHandlerStop
         flow["buttons"].append({**flow["button_draft"], "max_uses": uses})
         flow["button_draft"] = None
         flow["stage"] = "preview"
-        await update.message.reply_text("✅ دکمه اضافه شد", reply_markup=_new_builder_keyboard(flow_id))
+        await update.message.reply_text("✅ Button added.", reply_markup=_new_builder_keyboard(flow_id))
     else:
         return
     raise ApplicationHandlerStop
