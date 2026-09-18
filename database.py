@@ -674,7 +674,35 @@ def init_db():
     """)
     conn.commit()
 
-    # ---------------- Personalized callback buttons ----------------
+    # ---------------- Bans ----------------
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS bans (
+            user_id INTEGER PRIMARY KEY,
+            banned_until TEXT,
+            banned_at TEXT NOT NULL,
+            banned_by INTEGER
+        )
+    """)
+    conn.commit()
+
+    # ---------------- Favorite card (/fav) ----------------
+    # The card a player pinned with /fav [id]; /constellation always shows
+    # this card's image instead of a random one. Separate from
+    # user_favorite_character above, which is the AI-computed affinity
+    # favorite used by the Chat tab / memories.
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS user_fav_card (
+            user_id INTEGER PRIMARY KEY,
+            character_id INTEGER NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    """)
+    conn.commit()
+
+    conn.close()
+
+
+# ---------------- Personalized callback buttons ----------------
 
 def set_personalized_button_owner(chat_id: int, message_id: int, owner_user_id: int):
     conn = get_connection()
@@ -696,20 +724,6 @@ def get_personalized_button_owner(chat_id: int, message_id: int):
     ).fetchone()
     conn.close()
     return int(row["owner_user_id"]) if row else None
-
-
-# ---------------- Bans ----------------
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS bans (
-            user_id INTEGER PRIMARY KEY,
-            banned_until TEXT,
-            banned_at TEXT NOT NULL,
-            banned_by INTEGER
-        )
-    """)
-    conn.commit()
-
-    conn.close()
 
 
 # ---------------- Force-join settings ----------------
@@ -3229,6 +3243,52 @@ def set_character_persona(character_id: int, persona: str, age: str = None, gend
     conn.commit()
     conn.close()
     return True
+
+
+# ---------------- Favorite card (/fav) ----------------
+
+def set_favorite_card(user_id: int, character_id: int):
+    """Pins `character_id` as this player's favorite card (one per player,
+    replaces any previous choice)."""
+    conn = get_connection()
+    conn.execute(
+        """INSERT INTO user_fav_card (user_id, character_id, updated_at)
+           VALUES (?, ?, ?)
+           ON CONFLICT(user_id) DO UPDATE SET
+               character_id = excluded.character_id,
+               updated_at = excluded.updated_at""",
+        (user_id, character_id, datetime.utcnow().isoformat()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_favorite_card(user_id: int):
+    """The player's pinned favorite card as a character row (same shape
+    get_user_inventory returns), or None if they haven't set one, the
+    character no longer exists, or they don't own a copy anymore (gifted,
+    sold, traded away...). Callers fall back to a random card then; the
+    pin comes back on its own if they get the card again."""
+    conn = get_connection()
+    row = conn.execute(
+        """
+        SELECT characters.id, characters.name, characters.series, characters.image_file_id,
+               characters.media_type, characters.event_name,
+               rarities.name AS rarity_name
+        FROM user_fav_card
+        JOIN characters ON characters.id = user_fav_card.character_id
+        LEFT JOIN rarities ON characters.rarity_id = rarities.id
+        WHERE user_fav_card.user_id = ?
+          AND EXISTS (
+              SELECT 1 FROM user_characters
+              WHERE user_characters.user_id = user_fav_card.user_id
+                AND user_characters.character_id = user_fav_card.character_id
+          )
+        """,
+        (user_id,),
+    ).fetchone()
+    conn.close()
+    return row
 
 
 # ---------------- Gifting ----------------

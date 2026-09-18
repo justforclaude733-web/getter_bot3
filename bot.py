@@ -229,11 +229,22 @@ async def _force_join_required(update: Update, context: ContextTypes.DEFAULT_TYP
 
     try:
         member = await context.bot.get_chat_member(settings["chat_id"], user.id)
-        return member.status in ("left", "kicked")
+        return not _is_group_member(member)
     except Exception:
         logger.exception("Force-join membership check failed for user %s", user.id)
         # Fail closed: if the bot cannot verify membership, do not grant access.
         return True
+
+
+def _is_group_member(member) -> bool:
+    """True if this ChatMember is actually inside the group right now.
+    A 'restricted' user can be either still in the group (is_member=True)
+    or already gone (is_member=False), so that flag has to be checked."""
+    if member.status in ("creator", "administrator", "member"):
+        return True
+    if member.status == "restricted":
+        return bool(getattr(member, "is_member", False))
+    return False
 
 
 def _force_join_markup(settings=None, user_id=None):
@@ -289,11 +300,11 @@ async def _block_non_members(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 )
             else:
                 await update.callback_query.message.reply_text(
-                    notice, parse_mode=ParseMode.HTML, reply_markup=_force_join_markup(settings)
+                    notice, parse_mode=ParseMode.HTML, reply_markup=_force_join_markup(settings, user.id)
                 )
         elif update.effective_message:
             await update.effective_message.reply_text(
-                notice, parse_mode=ParseMode.HTML, reply_markup=_force_join_markup(settings)
+                notice, parse_mode=ParseMode.HTML, reply_markup=_force_join_markup(settings, user.id)
             )
     except Exception:
         logger.exception("Failed to send force-join prompt to user %s", user.id)
@@ -350,35 +361,65 @@ async def set_force_join_command(update: Update, context: ContextTypes.DEFAULT_T
 
 
 async def force_join_check_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """'I joined - Check' button. Personal: only the user the prompt was
+    made for can press it. On success the prompt message itself is edited
+    (no new message); on failure a popup tells them and the button stays."""
     query = update.callback_query
-    await query.answer()
     user = query.from_user
+
+    try:
+        target_id = int(query.data.rsplit(":", 1)[1])
+    except (ValueError, IndexError):
+        await query.answer("⚠️ Invalid button.", show_alert=True)
+        return
+
+    if target_id == 0:
+        # Prompts sent by older versions weren't bound to anyone. They were
+        # sent as a reply to the user's command, so its author is the owner.
+        replied = getattr(query.message, "reply_to_message", None)
+        replied_user = replied.from_user if replied else None
+        target_id = replied_user.id if (replied_user and not replied_user.is_bot) else user.id
+
+    if user.id != target_id:
+        await query.answer("⛔ This button belongs to another user.", show_alert=True)
+        return
+
     settings = db.get_force_join_settings()
     if not settings:
-        await query.message.reply_text(
-            "⚠️ The required group has not been configured yet. Please contact the owner."
+        await query.answer(
+            "⚠️ The required group has not been configured yet. Please contact the owner.",
+            show_alert=True,
         )
         return
 
     try:
         member = await context.bot.get_chat_member(settings["chat_id"], user.id)
-        joined = member.status not in ("left", "kicked")
+        joined = _is_group_member(member)
     except Exception:
+        logger.exception("Force-join re-check failed for user %s", user.id)
         joined = False
 
-    if joined:
-        await query.message.reply_text("✅ Membership confirmed. You can use the bot now.")
-    else:
-        await query.message.reply_text(
+    if not joined:
+        await query.answer(
             "❌ I still can't see you in the required group. Join it first, then check again.",
-            reply_markup=_force_join_markup(settings, user.id),
+            show_alert=True,
         )
+        return
+
+    await query.answer()
+    confirmed_text = "✅ Membership confirmed. You can use the bot now."
+    try:
+        # Edit the prompt in place (this also removes its buttons).
+        await query.edit_message_text(confirmed_text)
+    except Exception:
+        logger.exception("Could not edit force-join prompt for user %s", user.id)
+        if query.message is not None:
+            await query.message.reply_text(confirmed_text)
 
 
 async def _capture_user_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    _CURRENT_UPDATE_USER_ID.set(update.effective_user.id if update.effective_user else None)
     """
-    Runs first, ahead of every other handler, for every incoming update.
+    Runs early, ahead of the normal command handlers, for every incoming update.
     Only counts someone as a "real" user of the bot - and refreshes their
     display name - when they've actually used it: ran a command, tapped
     a button, or messaged the bot privately. A plain, non-command message
@@ -387,6 +428,7 @@ async def _capture_user_info(update: Update, context: ContextTypes.DEFAULT_TYPE)
     usage is captured separately in api_server.py's current_user(), since
     it never comes through here.
     """
+    _CURRENT_UPDATE_USER_ID.set(update.effective_user.id if update.effective_user else None)
     user = update.effective_user
     if user is None or user.is_bot:
         return
@@ -691,8 +733,9 @@ def build_constellation_page(owner_id: int, owner_display_name: str, page: int):
 
 async def send_constellation_summary(context: ContextTypes.DEFAULT_TYPE, target_chat_id: int,
                                        owner_id: int, owner_display_name: str, page: int = 0):
-    """Sends a random owned character's photo + the constellation menu (page 1
-    by default), with buttons to page through it and open the full photo gallery."""
+    """Sends the player's /fav card (or a random owned character if they haven't
+    set one) + the constellation menu (page 1 by default), with buttons to page
+    through it and open the full photo gallery."""
     items = db.get_user_inventory(owner_id)
     if not items:
         await context.bot.send_message(chat_id=target_chat_id, text="🌌 𝛵h𝛊s 𝝇𝛐𝛈stell𝛼𝛕𝛊𝛐𝛈 is 𝛠𐌼𝛒𝛕𝛄!")
@@ -700,10 +743,11 @@ async def send_constellation_summary(context: ContextTypes.DEFAULT_TYPE, target_
 
     text, keyboard = build_constellation_page(owner_id, owner_display_name, page)
 
-    random_item = random.choice(items)
-    if random_item["image_file_id"]:
+    favorite = db.get_favorite_card(owner_id)
+    featured_item = favorite if (favorite and favorite["image_file_id"]) else random.choice(items)
+    if featured_item["image_file_id"]:
         await _send_character_media(
-            context.bot, target_chat_id, random_item,
+            context.bot, target_chat_id, featured_item,
             caption=text[:1024], parse_mode=ParseMode.HTML, reply_markup=keyboard,
         )
     else:
@@ -733,10 +777,11 @@ async def constellation_page_callback(update: Update, context: ContextTypes.DEFA
     text, keyboard = build_constellation_page(owner_id, display_name, page)
 
     try:
-        if query.message.photo:
-            await query.edit_message_caption(caption=text[:1024], parse_mode=ParseMode.HTML, reply_markup=keyboard)
-        else:
+        # Text-only menu -> edit the text; any media card (photo OR video) -> edit the caption.
+        if getattr(query.message, "text", None):
             await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+        else:
+            await query.edit_message_caption(caption=text[:1024], parse_mode=ParseMode.HTML, reply_markup=keyboard)
     except Exception:
         pass  # e.g. "message not modified" when re-clicking the same page
 
@@ -748,6 +793,115 @@ async def constellation_command(update: Update, context: ContextTypes.DEFAULT_TY
     chat_id = update.effective_chat.id
 
     await send_constellation_summary(context, chat_id, user.id, display_name)
+
+
+# ---------------- /fav (favorite card) ----------------
+
+async def fav_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Pins one of your cards as your favorite - /constellation then always
+    shows that card's picture instead of a random one."""
+    if not context.args:
+        await update.message.reply_text(
+            "⚠️ Usage: <code>/fav [ID]</code>\n"
+            "Pick one of your cards - it becomes the picture shown on your /constellation.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    try:
+        char_id = int(context.args[0].lstrip("#"))
+    except ValueError:
+        await update.message.reply_text("⚠️ ID must be a number.")
+        return
+
+    user = update.effective_user
+
+    if not db.user_owns_character(user.id, char_id):
+        await update.message.reply_text("❓ You don't own that card.")
+        return
+
+    character = db.get_character(char_id)
+    if not character:
+        await update.message.reply_text(f"❓ No character found with ID #{char_id}.")
+        return
+
+    db.set_favorite_card(user.id, char_id)
+
+    caption = (
+        f"❤️ <b>{html.escape(character['name'])}</b> (#{char_id}) is now your favorite card.\n"
+        "It will be the picture on your /constellation from now on."
+    )
+    if character["image_file_id"]:
+        await send_character_result(
+            context, update.effective_chat.id, character, caption,
+            reply_to_message_id=update.message.message_id,
+        )
+    else:
+        await update.message.reply_text(caption, parse_mode=ParseMode.HTML)
+
+
+# ---------------- /miniapp ----------------
+
+MINIAPP_CARD_TEXT = (
+    "✦ WAIFU MARKET\n"
+    "\n"
+    "Your collection awaits.\n"
+    "Collect, trade & discover new characters."
+)
+MINIAPP_IMAGE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "miniapp.png")
+_MINIAPP_PHOTO_FILE_ID = None  # cached after the first upload so the PNG isn't re-uploaded every time
+
+
+def _miniapp_launch_button(label: str, chat_type: str, bot_username: str = None):
+    """A button that opens the Mini App, or None if it isn't configured.
+    Telegram only allows web_app buttons in PRIVATE chats. In groups the Mini
+    App has to be opened through its direct link (config.MINI_APP_DIRECT_LINK,
+    e.g. https://t.me/YourBot/app) so it still gets its login data; without
+    one, the button opens the bot's private chat instead."""
+    url = (config.MINI_APP_URL or "").strip()
+    if not url:
+        return None
+    if chat_type == "private":
+        return InlineKeyboardButton(label, web_app=WebAppInfo(url=url))
+    direct_link = (getattr(config, "MINI_APP_DIRECT_LINK", "") or "").strip()
+    if direct_link:
+        return InlineKeyboardButton(label, url=direct_link)
+    if bot_username:
+        return InlineKeyboardButton(label, url=f"https://t.me/{bot_username}")
+    return None
+
+
+async def miniapp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global _MINIAPP_PHOTO_FILE_ID
+
+    button = _miniapp_launch_button("🌙 Open the Mini App", update.effective_chat.type, context.bot.username)
+    if button is None:
+        await update.message.reply_text("⚠️ The Mini App isn't available yet.")
+        return
+    keyboard = InlineKeyboardMarkup([[button]])
+
+    if _MINIAPP_PHOTO_FILE_ID:
+        try:
+            await update.message.reply_photo(
+                photo=_MINIAPP_PHOTO_FILE_ID, caption=MINIAPP_CARD_TEXT, reply_markup=keyboard
+            )
+            return
+        except Exception:
+            logger.exception("Cached /miniapp photo failed, re-uploading it")
+            _MINIAPP_PHOTO_FILE_ID = None
+
+    try:
+        with open(MINIAPP_IMAGE_PATH, "rb") as photo:
+            sent = await update.message.reply_photo(
+                photo=photo, caption=MINIAPP_CARD_TEXT, reply_markup=keyboard
+            )
+    except FileNotFoundError:
+        logger.warning("Mini App image not found at %s - sending text only", MINIAPP_IMAGE_PATH)
+        await update.message.reply_text(MINIAPP_CARD_TEXT, reply_markup=keyboard)
+        return
+
+    if sent.photo:
+        _MINIAPP_PHOTO_FILE_ID = sent.photo[-1].file_id
 
 
 # ---------------- Dart game ----------------
@@ -2052,7 +2206,7 @@ async def set_sell_price_command(update: Update, context: ContextTypes.DEFAULT_T
 MARKET_PAGE_SIZE = 8
 
 
-def build_market_page(page: int):
+def build_market_page(page: int, chat_type: str = "private", bot_username: str = None):
     """Returns (text, keyboard) for one page of currently active /sell listings."""
     listings = db.get_active_listings()
 
@@ -2097,14 +2251,15 @@ def build_market_page(page: int):
     keyboard_rows = []
     if nav_row:
         keyboard_rows.append(nav_row)
-    if config.MINI_APP_URL:
-        keyboard_rows.append([InlineKeyboardButton("🛍 Open Market", web_app=WebAppInfo(url=config.MINI_APP_URL))])
+    open_button = _miniapp_launch_button("🛍 Open Market", chat_type, bot_username)
+    if open_button:
+        keyboard_rows.append([open_button])
 
     return text, InlineKeyboardMarkup(keyboard_rows) if keyboard_rows else None
 
 
 async def market_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text, keyboard = build_market_page(0)
+    text, keyboard = build_market_page(0, update.effective_chat.type, context.bot.username)
     await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
 
 
@@ -2113,7 +2268,7 @@ async def market_page_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     await query.answer()
 
     page = int(query.data.split(":")[1])
-    text, keyboard = build_market_page(page)
+    text, keyboard = build_market_page(page, query.message.chat.type, context.bot.username)
 
     try:
         await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
@@ -4706,6 +4861,12 @@ def build_help_text(user_id: int) -> str:
         "<b>/constellation</b>\n"
         "See your own collection, grouped by series, with a button to browse all your character photos.",
         "",
+        "<b>/fav [ID]</b>\n"
+        "Pick your favorite card - it becomes the picture shown on your /constellation.",
+        "",
+        "<b>/miniapp</b>\n"
+        "Open the Waifu Market Mini App.",
+        "",
         "<b>/check [ID]</b>\n"
         "See a character's photo, full details, who added it, and how many players own it.",
         "",
@@ -5066,25 +5227,35 @@ def main():
     threading.Thread(target=memories.run_nightly_engagement_loop, daemon=True).start()
 
     app = ApplicationBuilder().token(config.BOT_TOKEN).build()
-    _install_personal_button_guard()
 
-    app.add_handler(TypeHandler(Update, _block_banned_users), group=-2)
+    # IMPORTANT (python-telegram-bot): inside ONE group only the FIRST matching
+    # handler runs - the rest of that group is skipped. A TypeHandler(Update)
+    # matches everything, so each early "gate" handler needs its OWN group or
+    # the ones registered after it never fire. Groups run in ascending order.
+    #
+    # NOTE: _block_unowned_callbacks / _install_personal_button_guard (a global
+    # "only the person who triggered this message can press its buttons" guard)
+    # are intentionally NOT enabled: it would also lock out buttons that must be
+    # pressed by someone else (e.g. the owner approving a /send submission).
+    # Buttons that must be personal carry the user id in their callback_data and
+    # check it themselves (forcejoin, gift, trade, sellbot, conspage, ...).
+    app.add_handler(TypeHandler(Update, _block_banned_users), group=-5)
 
     # Count eligible group messages before normal group=0 handlers.
-    # Banned users have already been stopped at group=-2.
+    # Banned users have already been stopped at group=-5.
     # on_group_message handles spam/mute before touching the spawn counter.
     app.add_handler(MessageHandler(
         filters.ChatType.GROUPS
         & (filters.TEXT | filters.PHOTO | filters.VIDEO | filters.ANIMATION | filters.Sticker.ALL)
         & ~filters.COMMAND,
         on_group_message,
-    ), group=-1)
+    ), group=-4)
 
-    app.add_handler(TypeHandler(Update, _block_non_members), group=-1)
+    app.add_handler(TypeHandler(Update, _block_non_members), group=-3)
+    app.add_handler(TypeHandler(Update, _capture_user_info), group=-2)
+
     app.add_handler(CommandHandler("setforcejoin", set_force_join_command), group=0)
     app.add_handler(CallbackQueryHandler(force_join_check_callback, pattern=r"^forcejoin:check:\d+$"), group=0)
-    app.add_handler(TypeHandler(Update, _capture_user_info), group=-1)
-    app.add_handler(TypeHandler(Update, _block_unowned_callbacks), group=-1)
 
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("invite", invite_command))
@@ -5148,6 +5319,8 @@ def main():
     app.add_handler(CommandHandler("bin", bin_command))
     app.add_handler(CallbackQueryHandler(bin_callback, pattern=r"^bin:"))
     app.add_handler(CommandHandler("constellation", constellation_command))
+    app.add_handler(CommandHandler("fav", fav_command))
+    app.add_handler(CommandHandler("miniapp", miniapp_command))
     app.add_handler(CommandHandler("dart", dart_command))
     app.add_handler(CommandHandler("inv", inventory_currency_command))
     app.add_handler(CommandHandler("vypay", pay_command))

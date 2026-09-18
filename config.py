@@ -55,6 +55,12 @@ CURRENCY_SYMBOL = "VɎ"
 # of allowing any website to call it. Leave unset while testing locally.
 MINI_APP_URL = os.environ.get("MINI_APP_URL", "")
 
+# The Mini App's direct link inside Telegram (BotFather -> your bot -> Mini App),
+# e.g. https://t.me/YourBotUsername/appname. Telegram only allows the normal
+# "web app" button in PRIVATE chats, so /miniapp and /market use this link in
+# groups. Leave unset and the group button just opens the bot's private chat.
+MINI_APP_DIRECT_LINK = os.environ.get("MINI_APP_DIRECT_LINK", "")
+
 # --- Database ---
 # On Railway, set the DB_PATH Variable to a path inside your mounted
 # Volume (e.g. /data/bot_database.db) so data survives restarts.
