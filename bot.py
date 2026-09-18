@@ -2532,8 +2532,16 @@ async def allcharacters_command(update: Update, context: ContextTypes.DEFAULT_TY
 
 # ---------------- /check ----------------
 
-def build_channel_announcement(character, updated: bool = False) -> str:
-    if character["added_by_user_id"]:
+def build_channel_announcement(character, updated: bool = False, editor_id: int = None, editor_username: str = None) -> str:
+    if updated:
+        # The person who just made this edit, not whoever originally
+        # added the card - /check and build_card_caption still show the
+        # original adder, only this channel repost credits the editor.
+        if editor_id:
+            artist_display = f'<a href="tg://user?id={editor_id}">{format_display_name(editor_id, editor_username or "Unknown")}</a>'
+        else:
+            artist_display = editor_username or "Unknown"
+    elif character["added_by_user_id"]:
         artist_name = character["added_by_username"] or "Unknown"
         artist_display = f'<a href="tg://user?id={character["added_by_user_id"]}">{format_display_name(character["added_by_user_id"], artist_name)}</a>'
     else:
@@ -2541,9 +2549,10 @@ def build_channel_announcement(character, updated: bool = False) -> str:
 
     rarity_text = character["rarity_name"] if character["rarity_name"] else "Unranked"
 
+    banner = "𝐂𝐀𝐑𝐃 𝐔𝐏𝐃𝐀𝐓𝐄𝐃" if updated else "𝐍𝐄𝐖 𝐂𝐀𝐑𝐃 𝐃𝐈𝐒𝐂𝐎𝐕𝐄𝐑𝐄𝐃"
     lines = [
         "╭⊱⋅ ───────── ⋅⊰╮",
-        "𝐍𝐄𝐖 𝐂𝐀𝐑𝐃 𝐃𝐈𝐒𝐂𝐎𝐕𝐄𝐑𝐄𝐃",
+        banner,
         "╰⊱⋅ ───────── ⋅⊰╯",
         "",
         "❖ 𝐂𝐇𝐀𝐑𝐀𝐂𝐓𝐄𝐑",
@@ -2575,7 +2584,7 @@ def build_channel_announcement(character, updated: bool = False) -> str:
     return "\n".join(lines)
 
 
-async def _post_character_update_to_archive(context: ContextTypes.DEFAULT_TYPE, char_id: int):
+async def _post_character_update_to_archive(context: ContextTypes.DEFAULT_TYPE, char_id: int, editor_id: int, editor_username: str):
     """Reposts this character to the archive channel with an
     'UPDATED BY' footer (instead of 'DISCOVERED BY') whenever
     /editcharacter changes something. Best-effort - a failure here
@@ -2584,7 +2593,7 @@ async def _post_character_update_to_archive(context: ContextTypes.DEFAULT_TYPE, 
     character = db.get_character(char_id)
     if not character:
         return
-    caption_text = build_channel_announcement(character, updated=True)
+    caption_text = build_channel_announcement(character, updated=True, editor_id=editor_id, editor_username=editor_username)
     try:
         sent = await _send_character_media(
             context.bot, config.ARCHIVE_CHANNEL, character,
@@ -3150,7 +3159,7 @@ async def edit_character_apply_callback(update: Update, context: ContextTypes.DE
 
     updated = db.get_character(char_id)
     await query.edit_message_text(f"✅ {field_label} for <b>{updated['name']}</b> (#{char_id}) set to: {new_label}", parse_mode=ParseMode.HTML)
-    await _post_character_update_to_archive(context, char_id)
+    await _post_character_update_to_archive(context, char_id, user.id, user.username or user.first_name)
 
 
 async def capture_edit_character_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3178,7 +3187,8 @@ async def capture_edit_character_input(update: Update, context: ContextTypes.DEF
 
     label = "Name" if field == "name" else "Series"
     await update.message.reply_text(f"✅ {label} for character #{char_id} updated to: {value}")
-    await _post_character_update_to_archive(context, char_id)
+    editor = update.effective_user
+    await _post_character_update_to_archive(context, char_id, editor.id, editor.username or editor.first_name)
 
 
 # ---------------- Admin: /setpersonality (Chat tab) ----------------
