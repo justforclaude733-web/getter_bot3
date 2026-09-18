@@ -6,6 +6,7 @@ Uses SQLite (single file, no server needed - perfect for Termux).
 import sqlite3
 import random
 import json
+import unicodedata
 from datetime import datetime, timedelta
 
 from config import (
@@ -1256,24 +1257,59 @@ def get_distinct_series():
 
 # ---------------- Search ----------------
 
+def _normalize_search_text(text) -> str:
+    """Lowercased, NFKC-normalized form of a string, used for search
+    matching. NFKC folds stylized Unicode letters (e.g. the bold-font
+    event names like '🛡𝗙𝗶𝗴𝗵𝘁𝗲𝗿🛡') back to plain ASCII, so a search for
+    plain "fighter" still matches the styled name. Emoji are untouched
+    by NFKC, so this also naturally handles matching a rarity/event by
+    its leading emoji (it's just a substring of the stored name)."""
+    if not text:
+        return ""
+    return unicodedata.normalize("NFKC", text).lower()
+
+
 def search_characters(query: str):
+    """
+    Matches characters by name (full or partial/single word), series,
+    rarity (full name or its emoji), or event (full name - styled or
+    plain - or its emoji).
+
+    Multiple filters can be combined with '|', in any order, and all
+    must match (AND) - e.g. "Ada | 👑 | 🛡" and "🛡 | Ada | 👑" both mean
+    "name contains Ada AND rarity is 👑Sovereign AND event is 🛡Fighter🛡".
+    A query with no '|' is a single filter that matches any field.
+    """
+    parts = [p.strip() for p in query.split("|") if p.strip()]
+    if not parts:
+        return []
+
     conn = get_connection()
     cur = conn.cursor()
-    q_lower = query.strip().lower()
-    like_pattern = f"%{q_lower}%"
     cur.execute("""
         SELECT characters.*, rarities.name AS rarity_name, rarities.weight AS rarity_weight
         FROM characters
         LEFT JOIN rarities ON characters.rarity_id = rarities.id
-        WHERE LOWER(characters.name) LIKE ?
-           OR LOWER(characters.series) LIKE ?
-           OR LOWER(COALESCE(rarities.name, '')) LIKE ?
-           OR COALESCE(rarities.name, '') LIKE ?
-        ORDER BY characters.name
-    """, (like_pattern, like_pattern, like_pattern, f"{query.strip()}%"))
+    """)
     rows = cur.fetchall()
     conn.close()
-    return rows
+
+    results = []
+    for row in rows:
+        searchable_fields = [
+            _normalize_search_text(row["name"]),
+            _normalize_search_text(row["series"]),
+            _normalize_search_text(row["rarity_name"]),
+            _normalize_search_text(row["event_name"]),
+        ]
+        if all(
+            any(_normalize_search_text(part) in field for field in searchable_fields if field)
+            for part in parts
+        ):
+            results.append(row)
+
+    results.sort(key=lambda r: r["name"])
+    return results
 
 
 def get_all_characters():

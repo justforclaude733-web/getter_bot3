@@ -1811,7 +1811,10 @@ async def gift_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text(
-            "⚠️ Usage: <code>/search [name / series / rarity]</code>", parse_mode=ParseMode.HTML
+            "⚠️ Usage: <code>/search [name / rarity / event]</code>\n"
+            "Combine filters with <code>|</code>, in any order - "
+            "e.g. <code>/search Ada | 👑 | 🛡</code>",
+            parse_mode=ParseMode.HTML,
         )
         return
 
@@ -1959,11 +1962,7 @@ async def constellation_inline_query(update: Update, context: ContextTypes.DEFAU
         if not item["image_file_id"]:
             continue
         result_id = f"{item['id']}_{start + i}"
-        # Same full card info as /check, for every inline gallery this
-        # handler powers (constellation, search, gallery, and the
-        # no-query default) - not just the admin-facing gallery mode.
-        owners_count = db.count_owners(item["id"])
-        caption = build_card_caption(item, owners_count)
+        caption = build_inline_share_caption(item)
         if item["media_type"] == "video":
             results.append(InlineQueryResultCachedVideo(
                 id=result_id,
@@ -2001,6 +2000,16 @@ def _is_fighter_event_name(event_name: str) -> bool:
     normalized = unicodedata.normalize("NFKC", event_name).strip().lower()
     letters_only = re.sub(r"[^a-z]", "", normalized)
     return letters_only == config.FIGHTER_EVENT_NAME.lower()
+
+
+def _is_aevoria_rarity(rarity_name: str) -> bool:
+    """Same NFKC-fold-then-strip trick as _is_fighter_event_name, so this
+    matches the 🪽Aevoria rarity regardless of emoji/spacing around it."""
+    if not rarity_name:
+        return False
+    normalized = unicodedata.normalize("NFKC", rarity_name).strip().lower()
+    letters_only = re.sub(r"[^a-z]", "", normalized)
+    return letters_only == "aevoria"
 
 
 # ---------------- Shared: button-based rarity/event picker ----------------
@@ -2569,7 +2578,8 @@ def build_channel_announcement(character, updated: bool = False, editor_id: int 
         f"⤷ {rarity_text}",
     ]
     if character["event_name"]:
-        lines += ["", "❖<b>𝛦𝛻𝛦𝛮𝛵</b>", f"⤷ {character['event_name']}"]
+        event_label = "𝐓𝐫𝐞𝐧𝐝" if _is_aevoria_rarity(character["rarity_name"]) else "𝛦𝛻𝛦𝛮𝛵"
+        lines += ["", f"❖<b>{event_label}</b>", f"⤷ {character['event_name']}"]
 
     fighter = db.get_fighter_stats(character["id"])
     if fighter:
@@ -2603,6 +2613,25 @@ async def _post_character_update_to_archive(context: ContextTypes.DEFAULT_TYPE, 
         db.set_archive_message_id(char_id, sent.message_id)
     except Exception:
         logger.exception("Failed to post updated character to archive channel")
+
+
+def build_inline_share_caption(character) -> str:
+    """Caption shown under a card when someone sends it from the inline
+    gallery (search/constellation/gallery results) into a chat."""
+    rarity_text = character["rarity_name"] if character["rarity_name"] else "Unranked"
+    lines = [
+        "𝐇𝐄𝐘! 𝐂𝐇𝐄𝐂𝐊 𝐓𝐇𝐈𝐒 𝐎𝐔𝐓!",
+        "",
+        "╭─────────────── ✦",
+        f"│  {character['series']}",
+        f"│  {character['id']}  •  {character['name']}",
+        "│",
+        f"│  {rarity_text}",
+    ]
+    if character["event_name"]:
+        lines.append(f"│  {character['event_name']}")
+    lines.append("╰─────────────── ✦")
+    return "\n".join(lines)
 
 
 def build_card_caption(character, owners_count: int) -> str:
