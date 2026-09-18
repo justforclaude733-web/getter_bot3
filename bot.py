@@ -212,9 +212,9 @@ async def try_spawn(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
     prefix = rarity_name[0] if rarity_name else "✨"
 
     text = (
-        f"{prefix}𝛢 𝛈𝛠ᥕ 𝝇𝛠ᴌ𝛠𝛅𝛕𝛊𝛼ᴌ ར𝛠ᴌ𝛊𝝇\n"
-        "𝛼ᥕ𝛼𝛊𝛕𝛅 𝛊𝛕𝛅 𝛋𝛠𝛠𝛒𝛠ར!\n"
-        "𝛶𝛅𝛠 <b>/get [Name]</b> 𝛕𝛐 𐌼𝛼𝛋𝛠 𝛊𝛕 𝛒𝛼ར𝛕 𝛐ᵳ 𝛄𝛐𝛖ར 𝝇𝛐𝛈𝛅𝛕𝛠ᴌᴌ𝛼𝛕𝛊𝛐𝛈 ✨️"
+        f"{prefix}𝛢 𝛈ew 𝝇elestial relic\n"
+        "awaits its keeper!\n"
+        "Use <b>/get [Name]</b> to make it part of your constellation ✨️"
     )
 
     if character["image_file_id"]:
@@ -3633,14 +3633,14 @@ async def birthday_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------------- /start ----------------
 
 START_TEXT = (
-    "𝛶𝛐𝛋𝛐𝛅𝛐!\n"
+    "Yokoso!\n"
     "⎯꯭⎯꯭ׁ⎯꯭⎯꯭ׁ⎯꯭⎯꯭ׁ⎯꯭⎯꯭ׁ⎯꯭⎯꯭ׁ⎯꯭⎯꯭ׁ⎯꯭⎯꯭ׁ⎯꯭ \n\n"
-    "🪭𝛶𝛐𝛖 𝛼ར𝛠 𝛅𝛐 ᴌ𝛖𝝇𝛋𝛄 𝛃𝛠𝝇𝛼𝛖𝛅𝛠 𝛄𝛐𝛖 հ𝛼𝛎𝛠 𐌼𝛠 𝛈𝛐ᥕ! 𝐺𝛠𝛕𝛕𝛠ར 𝛃𝛐𝛕!\n"
+    "🪭𝛶ou are s𝛐 lu𝝇𝛋𝛄 because you have me now! 𝐺etter 𝛃ot!\n"
     "  \n"
-    "🪭𝑊հ𝛼𝛕 𝛼𐌼 𝛪 ᵳ𝛐ར? 𝛶𝛐𝛖 𝝇𝛼𝛈 𝛕𝛼𝛋𝛠 𝛕հ𝛠 𝝇𝛼ར𝛛 𝛼𝛈𝛛 𝛪'ᴌᴌ հ𝛐ᴌ𝛛 𝛊𝛕 ᵳ𝛐ར 𝛄𝛐𝛖!!\n\n"
-    "🪭𝛮𝛐ᥕ 𝛼𝛛𝛛 𐌼𝛠 𝛕𝛐 𝛕հ𝛠 ૭ར𝛐𝛖𝛒 𝛅𝛐 ᥕ𝛠 𝝇𝛼𝛈 𝝇𝛐ᴌᴌ𝛠𝝇𝛕 ᴌ𝛐𝛕𝛅 𝛐ᵳ 𝝇𝛼ར𝛛𝛅!!!\n"
+    "🪭𝑊hat am I for? 𝛶ou 𝝇an 𝛕ake the card and I'll h𝛐ld it for 𝛄ou!!\n\n"
+    "🪭𝛮ow 𝛼dd me to the gro𝛖𝛒 so ᥕe 𝝇a𝛈 colle𝝇𝛕 l𝛐ts of cards!!!\n"
     "‌\n"
-    "🧧 𝛶𝛅𝛠 /get [name] 𝛕𝛐 𝝇ᴌ𝛼𝛊𐌼 𝛼 𝛅𝛒𝛼ᥕ𝛈𝛠𝛛 𝝇հ𝛼ར𝛼𝝇𝛕𝛠ར."
+    "🧧 Use /get [name] to claim a spawned character."
 )
 
 START_IMAGE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "start.jpg")
