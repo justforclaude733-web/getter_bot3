@@ -3034,7 +3034,7 @@ def _new_post_keyboard(post_id: int, buttons):
 
 async def new_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    if not is_admin(user.id):
+    if not (is_admin(user.id) or is_manager(user.id) or is_marzieh(user.id)):
         await update.message.reply_text("⛔ You're not allowed to use this command.")
         return
 
@@ -3238,8 +3238,8 @@ async def new_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("⚠️ This button type is not supported.", show_alert=True)
         return
 
-    if not is_admin(user.id):
-        await query.answer("⛔ Only the bot owner can use this.", show_alert=True)
+    if not (is_admin(user.id) or is_manager(user.id) or is_marzieh(user.id)):
+        await query.answer("⛔ Only the owner, managers, and Marzieh can use this.", show_alert=True)
         return
 
     flow_id = data[2]
