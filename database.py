@@ -55,7 +55,12 @@ def init_db():
                      # Hidden Chat-tab persona (Update 3) - never exposed to players in
                      # Market/profile/card views, only read server-side when building the
                      # AI's system prompt for that character's conversations.
-                     "chat_persona TEXT", "chat_age TEXT", "chat_gender TEXT"):
+                     "chat_persona TEXT", "chat_age TEXT", "chat_gender TEXT",
+                     # id of this character's post in config.ARCHIVE_CHANNEL - the most
+                     # recent one, whether that was the original "discovered" post or a
+                     # later "updated" repost from /editcharacter. Lets /removecharacter
+                     # delete the channel message when the character itself is deleted.
+                     "archive_message_id INTEGER"):
         try:
             cur.execute(f"ALTER TABLE characters ADD COLUMN {col_def}")
         except sqlite3.OperationalError:
@@ -767,6 +772,19 @@ def get_character(character_id: int):
     row = cur.fetchone()
     conn.close()
     return row
+
+
+def set_archive_message_id(character_id: int, message_id: int):
+    """Remembers the id of this character's latest post in the archive
+    channel (see config.ARCHIVE_CHANNEL) - overwritten each time
+    /editcharacter reposts an updated version, so it always points at
+    whatever's currently the newest/most accurate post. /removecharacter
+    uses this to delete that message when the character itself goes."""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("UPDATE characters SET archive_message_id = ? WHERE id = ?", (message_id, character_id))
+    conn.commit()
+    conn.close()
 
 
 def pick_random_character():

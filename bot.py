@@ -2140,10 +2140,11 @@ async def _finalize_add_flow(pending_id: str, context: ContextTypes.DEFAULT_TYPE
         character = db.get_character(char_id)
         caption_text = build_channel_announcement(character)
         try:
-            await _send_character_media(
+            sent = await _send_character_media(
                 context.bot, config.ARCHIVE_CHANNEL, character,
                 caption=caption_text, parse_mode=ParseMode.HTML,
             )
+            db.set_archive_message_id(char_id, sent.message_id)
         except Exception:
             logger.exception("Failed to post new character to archive channel")
 
@@ -2407,6 +2408,13 @@ async def remove_character_command(update: Update, context: ContextTypes.DEFAULT
 
     character = db.get_character(char_id)
     if character and db.delete_character(char_id):
+        if character["archive_message_id"]:
+            try:
+                await context.bot.delete_message(
+                    chat_id=config.ARCHIVE_CHANNEL, message_id=character["archive_message_id"],
+                )
+            except Exception:
+                logger.exception("Failed to delete archive channel message for character #%s", char_id)
         await send_character_result(
             context, update.effective_chat.id, character,
             f"🗑️ Character #{char_id} removed (and cleared from everyone's constellation). "
@@ -2524,7 +2532,7 @@ async def allcharacters_command(update: Update, context: ContextTypes.DEFAULT_TY
 
 # ---------------- /check ----------------
 
-def build_channel_announcement(character) -> str:
+def build_channel_announcement(character, updated: bool = False) -> str:
     if character["added_by_user_id"]:
         artist_name = character["added_by_username"] or "Unknown"
         artist_display = f'<a href="tg://user?id={character["added_by_user_id"]}">{format_display_name(character["added_by_user_id"], artist_name)}</a>'
@@ -2562,8 +2570,29 @@ def build_channel_announcement(character) -> str:
             f"⤷ 𝛣𝛼𝛅𝛠 𝐷𝛠ᵳ𝛠𝛈𝛅𝛠: {fighter['base_defense']}",
         ]
 
-    lines += ["", "", f"╰┈➤ 𝐃𝐈𝐒𝐂𝐎𝐕𝐄𝐑𝐄𝐃 𝐁𝐘 : {artist_display} ✦"]
+    label = "𝐔𝐏𝐃𝐀𝐓𝐄𝐃 𝐁𝐘" if updated else "𝐃𝐈𝐒𝐂𝐎𝐕𝐄𝐑𝐄𝐃 𝐁𝐘"
+    lines += ["", "", f"╰┈➤ {label} : {artist_display} ✦"]
     return "\n".join(lines)
+
+
+async def _post_character_update_to_archive(context: ContextTypes.DEFAULT_TYPE, char_id: int):
+    """Reposts this character to the archive channel with an
+    'UPDATED BY' footer (instead of 'DISCOVERED BY') whenever
+    /editcharacter changes something. Best-effort - a failure here
+    (e.g. the bot losing channel admin rights) never blocks the edit
+    itself from succeeding, same as the original post-on-add path."""
+    character = db.get_character(char_id)
+    if not character:
+        return
+    caption_text = build_channel_announcement(character, updated=True)
+    try:
+        sent = await _send_character_media(
+            context.bot, config.ARCHIVE_CHANNEL, character,
+            caption=caption_text, parse_mode=ParseMode.HTML,
+        )
+        db.set_archive_message_id(char_id, sent.message_id)
+    except Exception:
+        logger.exception("Failed to post updated character to archive channel")
 
 
 def build_card_caption(character, owners_count: int) -> str:
@@ -2940,10 +2969,11 @@ async def submission_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     character = db.get_character(char_id)
     caption_text = build_channel_announcement(character)
     try:
-        await _send_character_media(
+        sent = await _send_character_media(
             context.bot, config.ARCHIVE_CHANNEL, character,
             caption=caption_text, parse_mode=ParseMode.HTML,
         )
+        db.set_archive_message_id(char_id, sent.message_id)
     except Exception:
         logger.exception("Failed to post new character to archive channel")
 
@@ -3120,6 +3150,7 @@ async def edit_character_apply_callback(update: Update, context: ContextTypes.DE
 
     updated = db.get_character(char_id)
     await query.edit_message_text(f"✅ {field_label} for <b>{updated['name']}</b> (#{char_id}) set to: {new_label}", parse_mode=ParseMode.HTML)
+    await _post_character_update_to_archive(context, char_id)
 
 
 async def capture_edit_character_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3147,6 +3178,7 @@ async def capture_edit_character_input(update: Update, context: ContextTypes.DEF
 
     label = "Name" if field == "name" else "Series"
     await update.message.reply_text(f"✅ {label} for character #{char_id} updated to: {value}")
+    await _post_character_update_to_archive(context, char_id)
 
 
 # ---------------- Admin: /setpersonality (Chat tab) ----------------
