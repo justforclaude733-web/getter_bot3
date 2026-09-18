@@ -4943,6 +4943,17 @@ def main():
     _install_personal_button_guard()
 
     app.add_handler(TypeHandler(Update, _block_banned_users), group=-2)
+
+    # Count eligible group messages before normal group=0 handlers.
+    # Banned users have already been stopped at group=-2.
+    # on_group_message handles spam/mute before touching the spawn counter.
+    app.add_handler(MessageHandler(
+        filters.ChatType.GROUPS
+        & (filters.TEXT | filters.PHOTO | filters.VIDEO | filters.ANIMATION | filters.Sticker.ALL)
+        & ~filters.COMMAND,
+        on_group_message,
+    ), group=-1)
+
     app.add_handler(TypeHandler(Update, _block_non_members), group=-1)
     app.add_handler(CommandHandler("setforcejoin", set_force_join_command), group=0)
     app.add_handler(CallbackQueryHandler(force_join_check_callback, pattern=r"^forcejoin:check:\d+$"), group=0)
@@ -5051,12 +5062,6 @@ def main():
     # its own group - only acts when the owner has an active /player prompt
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, capture_player_input), group=3)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, capture_edit_character_input), group=4)
-
-    # counts every normal group text message for spawn + spam tracking
-    app.add_handler(MessageHandler(
-        filters.ChatType.GROUPS & (filters.TEXT | filters.Sticker.ALL | filters.ANIMATION) & ~filters.COMMAND,
-        on_group_message,
-    ))
 
     logger.info("Bot starting...")
     app.run_polling()
