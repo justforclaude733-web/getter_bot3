@@ -246,16 +246,11 @@ async def set_force_join_command(update: Update, context: ContextTypes.DEFAULT_T
         )
         return
 
-    # Create a bot-owned permanent invite link instead of relying on the
-    # original/private link supplied during setup. This link has no expiration
-    # or usage limit unless it is explicitly revoked by an administrator.
+    # Generate a fresh primary invite link owned by this bot. Telegram
+    # guarantees this link is permanent unless it is revoked, and generating
+    # a new primary link also replaces the bot's previous primary link.
     try:
-        invite = await context.bot.create_chat_invite_link(
-            chat_id=chat.id,
-            name="Bot force-join",
-            creates_join_request=False,
-        )
-        invite_link = invite.invite_link
+        invite_link = await context.bot.export_chat_invite_link(chat.id)
     except Exception:
         logger.exception("Failed to create permanent force-join invite link for chat %s", chat.id)
         await update.effective_message.reply_text(
