@@ -565,10 +565,9 @@ async def inventory_currency_command(update: Update, context: ContextTypes.DEFAU
     display_name = db.get_display_name(user.id)
 
     lines = [
-        "╔══════════════════════════╗",
-        f"║       🎒 {_bold_sans('INVENTORY')}       ║",
-        "╚══════════════════════════╝",
-        "",
+        "╔════════════════════════╗",
+        f"║                    🎒 {_bold_sans('INVENTORY')}                    ║",
+        "╚════════════════════════╝",
         f"       👤 {display_name}",
         f"       🏆 {_bold_sans('Rank')}  {rank_text}",
         "",
@@ -577,6 +576,8 @@ async def inventory_currency_command(update: Update, context: ContextTypes.DEFAU
         "",
         f"       🎴 {_bold_sans(f'{card_count:,}')}",
         f"          {_bold_sans('CARDS')}",
+        "",
+        " ╔╗╚╝╔╗╚╝╔╗╚╝╔╗╚╝╔╗╚╝╔╗╚╝╔╗",
     ]
     text = "\n".join(lines)
 
