@@ -248,6 +248,17 @@ def init_db():
         )
     """)
 
+    # The base price ranges were corrected: forget the old live prices once so /prices
+    # starts from the new ranges (economy.ensure_prices_seeded re-creates the rows).
+    cur.execute("SELECT 1 FROM schema_migrations WHERE name = 'rarity_prices_reset_v2'")
+    if not cur.fetchone():
+        try:
+            cur.execute("DELETE FROM rarity_market_prices")
+        except sqlite3.OperationalError:
+            pass  # table not created yet on a brand-new database - nothing to reset
+        cur.execute("INSERT INTO schema_migrations (name) VALUES ('rarity_prices_reset_v2')")
+        conn.commit()
+
     # /sort filters used to live in user_filters (one per player) - copy them over once.
     cur.execute("SELECT 1 FROM schema_migrations WHERE name = 'user_filter_items_v1'")
     if not cur.fetchone():

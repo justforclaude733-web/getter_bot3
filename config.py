@@ -130,25 +130,28 @@ ARENA_NPC_IDS = {npc["id"] for npc in ARENA_NPC_OPPONENTS}
 # price /prices shows drifts away from these over time based on real
 # activity (see economy.py) but is always kept within
 # PRICE_FLOOR_MULTIPLIER..PRICE_CEILING_MULTIPLIER of these numbers.
+# Listed from the cheapest to the priciest tier - /prices shows them in this
+# order and /rarities uses it (reversed) to put the rarest tier first.
 RARITY_BASE_PRICES = {
     "Common":    (10, 15),
     "Rare":      (12, 20),
-    "Mystic":    (20, 35),
-    "Legendary": (35, 60),
-    "Elysian":   (120, 180),
-    "Prismatic": (180, 300),
-    "Nocturne":  (700, 1200),
-    "Sovereign": (1000, 1800),
+    "Mystic":    (20, 24),
+    "Legendary": (50, 80),
+    "Elysian":   (120, 250),
+    "Prismatic": (400, 700),
+    "Nocturne":  (1500, 1700),
+    "Ethereal":  (2000, 2500),
+    "Sovereign": (3000, 4000),
     "Aevoria":   (7000, 9000),
-    "Celestial": (8000, 11000),
-    "Singular":  (15000, 19000),
+    "Celestial": (10000, 12000),
+    "Singular":  (17000, 20000),
     "Omnara":    (20000, 30000),
 }
 
 RARITY_PRICE_EMOJIS = {
     "Common": "⚪", "Rare": "🟠", "Mystic": "🟢", "Legendary": "🟡",
-    "Elysian": "🪻", "Prismatic": "💎", "Nocturne": "🌙", "Sovereign": "👑",
-    "Aevoria": "🪽", "Celestial": "🌌", "Singular": "🪐", "Omnara": "💫",
+    "Elysian": "🪻", "Prismatic": "💎", "Nocturne": "🌙", "Ethereal": "🫧",
+    "Sovereign": "👑", "Aevoria": "🪽", "Celestial": "🌌", "Singular": "🪐", "Omnara": "💫",
 }
 
 # How often (seconds) the live prices above get recalculated.
@@ -189,22 +192,22 @@ EVENT_PRICE_TIERS = [
     {
         "label": "🌟 S+ Tier",
         "range": "+80%-120%",
-        "events": ["🌌𝗔𝘀𝘁𝗿𝗮𝗹𝗶𝘀🌌", "🪽𝗦𝗲𝗿𝗮𝗽𝗵𝗶𝗺🪽", "☢️𝗔𝗽𝗼𝗰𝗮𝗹𝘆𝗽𝘀𝗲☢️", "🏛️𝗢𝗹𝘆𝗺𝗽𝘂𝘀🏛️", "🌊𝗔𝘁𝗹𝗮𝗻𝘁𝗶𝘀🌊"],
+        "events": ["🌌𝗔𝘀𝘁𝗿𝗮𝗹𝗶𝘀🌌", "🪽𝗦𝗲𝗿𝗮𝗽𝗵𝗶𝗺🪽", "☢️𝗔𝗽𝗼𝗰𝗮𝗹𝘆𝗽𝘀𝗲☢️", "🏛️𝗢𝗹𝘆𝗺𝗽𝘂𝘀🏛️", "🌊𝗔𝘁𝗹𝗮𝗻𝘁𝗶𝘀🌊", "🧷𝗙𝗮𝗸𝗲 𝗖𝗼𝗹𝗹𝗮𝗴𝗲🧷"],
     },
     {
         "label": "⭐ S Tier",
         "range": "+50%-80%",
-        "events": ["🦇𝗩𝗮𝗺𝗽𝘆𝗿𝗶𝗮🦇", "🔥𝗜𝗻𝗳𝗲𝗿𝗻𝗼🔥", "🦊𝗞𝗶𝘁𝘀𝘂𝗻𝗲🦊", "🥷𝗦𝗵𝗶𝗻𝗼𝗯𝗶🥷", "🏴‍☠️𝗣𝗶𝗿𝗮𝘁𝗲𝘀🏴‍☠️", "🎭𝗠𝗮𝘀𝗾𝘂𝗲𝗿𝗮𝗱𝗲🎭"],
+        "events": ["🦇𝗩𝗮𝗺𝗽𝘆𝗿𝗶𝗮🦇", "🔥𝗜𝗻𝗳𝗲𝗿𝗻𝗼🔥", "🦊𝗞𝗶𝘁𝘀𝘂𝗻𝗲🦊", "🥷𝗦𝗵𝗶𝗻𝗼𝗯𝗶🥷", "🏴‍☠️𝗣𝗶𝗿𝗮𝘁𝗲𝘀🏴‍☠️", "🎭𝗠𝗮𝘀𝗾𝘂𝗲𝗿𝗮𝗱𝗲🎭", "🌫𝗗𝗿𝘂𝗸𝗮𝗲🌫", "🍃𝗡𝗮𝘁𝘂𝗿𝗲🍃"],
     },
     {
         "label": "💎 A Tier",
         "range": "+30%-50%",
-        "events": ["💘𝗔𝗺𝗼𝗿𝗶𝗮💘", "🕯️𝗣𝗵𝗮𝗻𝘁𝗼𝗺🕯️", "⚔️𝗦𝗮𝗺𝘂𝗿𝗮𝗶⚔️", "💿𝗡𝗲𝗼𝗻💿", "🎃𝗛𝗮𝗹𝗹𝗼𝘄🎃", "🎄𝗘𝘃𝗲𝗿𝗴𝗿𝗲𝗲𝗻🎄"],
+        "events": ["💘𝗔𝗺𝗼𝗿𝗶𝗮💘", "🕯️𝗣𝗵𝗮𝗻𝘁𝗼𝗺🕯️", "⚔️𝗦𝗮𝗺𝘂𝗿𝗮𝗶⚔️", "💿𝗡𝗲𝗼𝗻💿", "🎃𝗛𝗮𝗹𝗹𝗼𝘄🎃", "🎄𝗘𝘃𝗲𝗿𝗴𝗿𝗲𝗲𝗻🎄", "📸𝗗𝗼𝗹𝗰𝗲 & 𝗚𝗮𝗯𝗯𝗮𝗻𝗮📸"],
     },
     {
         "label": "🟢 B Tier",
         "range": "+15%-30%",
-        "events": ["🍽️𝗚𝗮𝘀𝘁𝗿𝗶𝗮🍽️", "🌸𝗛𝗮𝗻𝗮𝗺𝗶🌸", "🃏𝗝𝗲𝘀𝘁𝗲𝗿🃏", "🐰𝗕𝘂𝗻𝗻𝘆🐰", "☀️𝗖𝗼𝘸𝗯𝗼𝘆☀️", "🍾𝗕𝗮𝗿𝘁𝗲𝗻𝗱𝗲𝗿🍾"],
+        "events": ["🍽️𝗚𝗮𝘀𝘁𝗿𝗶𝗮🍽️", "🌸𝗛𝗮𝗻𝗮𝗺𝗶🌸", "🃏𝗝𝗲𝘀𝘁𝗲𝗿🃏", "🐰𝗕𝘂𝗻𝗻𝘆🐰", "☀️𝗖𝗼𝘸𝗯𝗼𝘆☀️", "🍾𝗕𝗮𝗿𝘁𝗲𝗻𝗱𝗲𝗿🍾", "🪭𝗣𝗮𝗽𝗮𝗿𝗮𝘇𝘇𝗶🪭"],
     },
     {
         "label": "⚪ C Tier",

@@ -37,9 +37,9 @@ _NORMALIZED_TIERS = {_normalize(name): name for name in config.RARITY_BASE_PRICE
 
 
 def match_price_tier(raw_rarity_name: str):
-    """Maps a raw rarities.name value to one of the twelve canonical
-    economy tiers, or None if it's a custom rarity the pricing system
-    doesn't manage."""
+    """Maps a raw rarities.name value to one of the canonical economy tiers
+    in config.RARITY_BASE_PRICES, or None if it's a custom rarity the pricing
+    system doesn't manage."""
     return _NORMALIZED_TIERS.get(_normalize(raw_rarity_name))
 
 
@@ -56,6 +56,17 @@ def ensure_prices_seeded():
             db.set_rarity_market_price(name, base_min, base_max, now)
             newly_seeded.add(name)
     return newly_seeded
+
+
+def _drift_toward(current: float, base: float, pct: float) -> float:
+    """Moves `current` about `pct` of itself closer to `base` (at least 1 unit, so small
+    prices don't get stuck on rounding) without ever overshooting it."""
+    step = max(1, round(current * pct))
+    if current > base:
+        return max(base, current - step)
+    if current < base:
+        return min(base, current + step)
+    return current
 
 
 def compute_price_update(current_min, current_max, base_min, base_max, counts, total_cards):
@@ -82,14 +93,17 @@ def compute_price_update(current_min, current_max, base_min, base_max, counts, t
         scarcity_mult = 1.0
 
     if activity <= 0:
-        pct_change = -config.PRICE_IDLE_DECAY_PCT
+        # Nothing happened: drift back TOWARD the base price - never past it. (This used
+        # to always subtract 2%, so an idle tier sank hourly all the way to half its
+        # base price and /prices never showed the real ranges.)
+        new_min = _drift_toward(current_min, base_min, config.PRICE_IDLE_DECAY_PCT)
+        new_max = _drift_toward(current_max, base_max, config.PRICE_IDLE_DECAY_PCT)
     else:
         pct_change = activity * scarcity_mult * config.PRICE_SENSITIVITY
         pct_change = max(-config.PRICE_MAX_HOURLY_CHANGE_PCT,
                           min(config.PRICE_MAX_HOURLY_CHANGE_PCT, pct_change))
-
-    new_min = current_min * (1 + pct_change)
-    new_max = current_max * (1 + pct_change)
+        new_min = current_min * (1 + pct_change)
+        new_max = current_max * (1 + pct_change)
 
     floor_min = base_min * config.PRICE_FLOOR_MULTIPLIER
     floor_max = base_max * config.PRICE_FLOOR_MULTIPLIER

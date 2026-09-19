@@ -4950,8 +4950,20 @@ def _rarity_bar(owned: int, total: int):
     return bar, percent
 
 
+def _rarity_list_order(rarity):
+    """Sort key for /rarities: the rarest tier first, following the economy tier order
+    (Omnara ... Rare, Common - the reverse of config.RARITY_BASE_PRICES). Spawn weight
+    can't be used for this: it isn't guaranteed to rank Rare above Common. Rarities
+    the economy doesn't know go last, rarest weight first."""
+    tiers = list(config.RARITY_BASE_PRICES)
+    tier = economy.match_price_tier(rarity["name"])
+    if tier is None:
+        return (1, 0, rarity["weight"])
+    return (0, -tiers.index(tier), rarity["weight"])
+
+
 async def rarities_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    rarities = sorted(db.list_rarities(), key=lambda r: r["weight"])
+    rarities = sorted(db.list_rarities(), key=_rarity_list_order)
     if not rarities:
         await update.message.reply_text("🎖 No rarities have been added yet.")
         return
