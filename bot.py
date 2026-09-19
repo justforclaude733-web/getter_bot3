@@ -101,6 +101,27 @@ SELF_GUARDED_CALLBACK_PREFIXES = ("forcejoin:check:",)
 _EXEMPT_CALLBACK_PREFIXES = PUBLIC_CALLBACK_PREFIXES + SELF_GUARDED_CALLBACK_PREFIXES
 
 
+# Every command this bot handles (filled in by main() from the registered handlers).
+KNOWN_COMMANDS = set()
+
+
+def _our_command(message, bot_username: str):
+    """The command name (lowercase, no slash) if `message` is a command meant for THIS
+    bot, else None. Other bots' commands - "/play@OtherBot", or a plain "/daily" that only
+    some other bot in the group understands - must not trigger anything here (join
+    prompts, ban notices, user tracking)."""
+    if message is None:
+        return None
+    text = message.text or message.caption or ""
+    if not text.startswith("/"):
+        return None
+    name, _, target = text.split(maxsplit=1)[0][1:].partition("@")
+    if target and target.lower() != (bot_username or "").lower():
+        return None  # explicitly addressed to a different bot
+    name = name.lower()
+    return name if name in KNOWN_COMMANDS else None
+
+
 def _markup_has_personal_buttons(reply_markup) -> bool:
     """True if the keyboard has at least one callback button that must be personal."""
     if not reply_markup or not getattr(reply_markup, "inline_keyboard", None):
@@ -299,13 +320,15 @@ async def _block_non_members(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     # Force-join must only run for commands and callback buttons.
     # Normal messages must never receive a membership warning.
+    # Only OUR commands: another bot's "/command@OtherBot" (or a command this bot
+    # doesn't have) must not get a membership warning from us.
     message = update.effective_message
-    text = (message.text or message.caption or "") if message else ""
-    is_command = bool(message and text.startswith("/"))
+    command = _our_command(message, context.bot.username)
+    is_command = command is not None
     is_callback = update.callback_query is not None
 
     # The setup command and membership-check button must always be allowed through.
-    if text.startswith("/setforcejoin"):
+    if command == "setforcejoin":
         return
     if update.callback_query and (update.callback_query.data or "").startswith("forcejoin:check:"):
         return
@@ -468,8 +491,7 @@ async def _capture_user_info(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     message = update.effective_message
-    text_or_caption = (message.text or message.caption) if message else None
-    is_command = bool(text_or_caption and text_or_caption.startswith("/"))
+    is_command = _our_command(message, context.bot.username) is not None
     is_private_message = bool(message and update.effective_chat and update.effective_chat.type == "private")
     is_button_tap = update.callback_query is not None
 
@@ -532,7 +554,7 @@ async def _send_character_media(bot, chat_id, character, caption=None, parse_mod
 
 
 async def try_spawn(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    character = db.pick_random_character()
+    character = db.pick_random_character(chat_id)
     if character is None:
         return False  # no characters added yet, nothing to spawn
 
@@ -623,7 +645,7 @@ async def get_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if db.get_daily_capture_count(user.id) >= capture_limit:
         await update.message.reply_text(
             f"😴 You've reached your daily capture limit ({capture_limit}/{capture_limit}). "
-            f"Come back after reset at midnight! 🌙"
+            f"Your limit resets at midnight Iran time! 🌙"
         )
         return
 
@@ -719,10 +741,14 @@ def build_constellation_page(owner_id: int, owner_display_name: str, page: int):
     start = page * page_size
     page_entries = flat_entries[start:start + page_size]
 
-    filter_row = db.get_user_filter(owner_id)
-    if filter_row and filter_row["filter_type"] and filter_row["filter_value"]:
-        search_line = filter_row["filter_type"]
-        sort_line = filter_row["filter_value"]
+    active_filters = db.get_user_filters(owner_id)
+    if active_filters:
+        kinds = [k for k in db.FILTER_TYPES if any(f["filter_type"] == k for f in active_filters)]
+        search_line = ", ".join(_SORT_KIND_INFO[k][1] for k in kinds)
+        sort_line = " • ".join(
+            ", ".join(html.escape(f["filter_value"]) for f in active_filters if f["filter_type"] == k)
+            for k in kinds
+        )
     else:
         search_line = "None"
         sort_line = "None"
@@ -968,7 +994,7 @@ async def dart_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if used_today >= dart_limit:
         await update.message.reply_text(
             f"🎯 You're out of darts for today ({dart_limit}/{dart_limit}). "
-            f"Come back tomorrow!"
+            f"They come back at midnight Iran time!"
         )
         return
 
@@ -1634,7 +1660,7 @@ async def _block_banned_users(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     message = update.effective_message
-    is_command = bool(message and (message.text or message.caption or "").startswith("/"))
+    is_command = _our_command(message, context.bot.username) is not None
     is_private = update.effective_chat is not None and update.effective_chat.type == "private"
     if message is not None and (is_command or is_private):
         # Only answer when the banned user actually tried to use the bot; their
@@ -2469,62 +2495,186 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------------- /sort ----------------
+# A player can stack any number of filters: characters, series, rarities, events.
+# Values of the SAME kind are OR-ed ("Yae" or "Law"), different kinds are AND-ed
+# ("...and Legendary or Prismatic ...and Fighter"). See db._card_passes_filters().
+
+_SORT_KIND_INFO = {
+    "character": ("🧑", "Character"),
+    "series": ("🎬", "Series"),
+    "rarity": ("💎", "Rarity"),
+    "event": ("🎉", "Event"),
+}
+
+
+def _short_label(text: str, limit: int = 32) -> str:
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _sort_filters_text(filters) -> str:
+    """Multi-line summary of the active filters (HTML)."""
+    grouped = {}
+    for f in filters:
+        grouped.setdefault(f["filter_type"], []).append(f["filter_value"])
+    lines = []
+    for kind in db.FILTER_TYPES:
+        if kind in grouped:
+            emoji, label = _SORT_KIND_INFO[kind]
+            lines.append(f"{emoji} <b>{label}:</b> " + ", ".join(html.escape(v) for v in grouped[kind]))
+    return "\n".join(lines)
+
+
+def _sort_menu(user_id: int):
+    """(text, keyboard) of the main /sort menu for this player."""
+    filters = db.get_user_filters(user_id)
+    lines = ["🗂 <b>Sort your constellation</b>", ""]
+    if filters:
+        lines.append(_sort_filters_text(filters))
+        lines += [
+            "",
+            "A card is shown when it matches <i>at least one</i> value of <i>every</i> group above.",
+        ]
+    else:
+        lines.append("No filters yet - your constellation shows everything.")
+    lines += ["", "Add as many filters as you like:"]
+
+    rows = [
+        [InlineKeyboardButton("🧑 Character", callback_data="sortmenu:character"),
+         InlineKeyboardButton("🎬 Series", callback_data="sortmenu:series")],
+        [InlineKeyboardButton("💎 Rarity", callback_data="sortmenu:rarity"),
+         InlineKeyboardButton("🎉 Event", callback_data="sortmenu:event")],
+    ]
+    for f in filters:
+        emoji, _ = _SORT_KIND_INFO.get(f["filter_type"], ("•", ""))
+        rows.append([InlineKeyboardButton(
+            f"❌ {emoji} {_short_label(f['filter_value'])}", callback_data=f"sortdel:{f['id']}"
+        )])
+    if filters:
+        rows.append([InlineKeyboardButton("🗑️ Clear all filters", callback_data="sortmenu:clear")])
+    return "\n".join(lines), InlineKeyboardMarkup(rows)
+
+
+def _sort_picker_options(kind: str):
+    """[(value, callback_data)] for the rarity / event pickers."""
+    if kind == "rarity":
+        return [(r["name"], f"sortval:rarity:{r['id']}") for r in db.list_rarities()]
+    return [(e["name"], f"sortval:event:{i}") for i, e in enumerate(db.get_all_events())]
+
+
+def _sort_picker(user_id: int, kind: str):
+    """(text, keyboard) of the rarity / event multi-select. Tap = toggle."""
+    options = _sort_picker_options(kind)
+    emoji, label = _SORT_KIND_INFO[kind]
+    if not options:
+        text = f"❓ No {label.lower()}s have been created yet."
+        rows = []
+    else:
+        active = {_norm(f["filter_value"]) for f in db.get_user_filters(user_id) if f["filter_type"] == kind}
+        text = f"{emoji} <b>Pick {label.lower()}s</b>\nTap to turn each one on or off - you can pick several."
+        rows = [
+            [InlineKeyboardButton(
+                ("✅ " if _norm(name) in active else "") + _short_label(name, 40), callback_data=data
+            )]
+            for name, data in options
+        ]
+    rows.append([InlineKeyboardButton("◀️ Back", callback_data="sortmenu:main")])
+    return text, InlineKeyboardMarkup(rows)
+
+
+def _norm(text: str) -> str:
+    return db._normalize_search_text(text)
+
 
 async def sort_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🧑 By character", callback_data="sortmenu:character")],
-        [InlineKeyboardButton("🎬 By series", callback_data="sortmenu:series")],
-        [InlineKeyboardButton("💎 By rarity", callback_data="sortmenu:rarity")],
-        [InlineKeyboardButton("🗑️ Clear filters", callback_data="sortmenu:clear")],
-    ])
-    await update.message.reply_text(
-        "How would you like to sort your constellation?", reply_markup=keyboard
-    )
+    context.user_data.pop("awaiting_filter_type", None)
+    text, keyboard = _sort_menu(update.effective_user.id)
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+
+
+async def _show_sort_menu(query, user_id: int):
+    text, keyboard = _sort_menu(user_id)
+    try:
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+    except TelegramError:
+        pass  # "message is not modified" when nothing changed
 
 
 async def sort_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
+    user_id = query.from_user.id
     action = query.data.split(":", 1)[1]
 
+    if action != "character" and action != "series":
+        context.user_data.pop("awaiting_filter_type", None)
+
+    if action == "main":
+        await _show_sort_menu(query, user_id)
+        return
+
     if action == "clear":
-        db.clear_user_filter(query.from_user.id)
-        await query.edit_message_text("✅ Filters cleared - your constellation will show everything again.")
+        db.clear_user_filter(user_id)
+        await _show_sort_menu(query, user_id)
         return
 
-    if action == "rarity":
-        rarities = db.list_rarities()
-        if not rarities:
-            await query.edit_message_text("❓ No rarities have been created yet.")
-            return
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton(r["name"], callback_data=f"sortval:rarity:{r['id']}")]
-            for r in rarities
-        ])
-        await query.edit_message_text("💎 Pick a rarity to sort by:", reply_markup=keyboard)
+    if action in ("rarity", "event"):
+        text, keyboard = _sort_picker(user_id, action)
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
         return
 
-    label = {"character": "character name", "series": "series name"}[action]
-    context.user_data["awaiting_filter_type"] = action
-    await query.edit_message_text(f"✏️ Type the {label} you want to filter by:")
+    if action in ("character", "series"):
+        context.user_data["awaiting_filter_type"] = {"kind": action, "chat_id": query.message.chat.id}
+        example = "Yae" if action == "character" else "Genshin"
+        await query.edit_message_text(
+            f"✏️ Type the {action} name - one word is enough (for example <code>{example}</code>).\n"
+            "To add several at once, separate them with <code>|</code>.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Back", callback_data="sortmenu:main")]]),
+        )
 
 
 async def sort_value_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles picking a rarity button from the /sort menu."""
+    """A rarity / event button in the picker: turns that filter on or off."""
     query = update.callback_query
     await query.answer()
 
-    _, filter_type, value = query.data.split(":", 2)
-    if filter_type == "rarity" and value.isdigit():
-        # Buttons carry the rarity id (callback_data is capped at 64 bytes, names can be long/fancy).
-        rarity = db.get_rarity_by_id(int(value))
-        if not rarity:
-            await query.edit_message_text("❓ That rarity no longer exists.")
+    user_id = query.from_user.id
+    _, kind, value = query.data.split(":", 2)
+    if kind not in ("rarity", "event"):
+        return
+
+    if value.isdigit():
+        # Buttons carry an id / list position (callback_data is capped at 64 bytes).
+        options = _sort_picker_options(kind)
+        if kind == "rarity":
+            name = next((n for n, data in options if data == query.data), None)
+        else:
+            name = options[int(value)][0] if int(value) < len(options) else None
+        if name is None:
+            await query.answer("❓ That option no longer exists.", show_alert=True)
             return
-        value = rarity["name"]
-    db.set_user_filter(query.from_user.id, filter_type, value)
-    await query.edit_message_text(f"✅ Your constellation is now sorted by {filter_type}: {value}")
+    else:
+        name = value  # older messages carried the rarity name itself
+
+    db.toggle_user_filter(user_id, kind, name)
+    text, keyboard = _sort_picker(user_id, kind)
+    try:
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+    except TelegramError:
+        pass
+
+
+async def sort_remove_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """The ❌ button next to one active filter."""
+    query = update.callback_query
+    await query.answer()
+    try:
+        filter_id = int(query.data.split(":", 1)[1])
+    except ValueError:
+        return
+    db.remove_user_filter(query.from_user.id, filter_id)
+    await _show_sort_menu(query, query.from_user.id)
 
 
 async def capture_sort_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2548,26 +2698,46 @@ async def capture_sort_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     awaiting = context.user_data.get("awaiting_filter_type")
-    if not awaiting:
-        return
+    if not awaiting or awaiting.get("chat_id") != update.effective_chat.id:
+        return  # not waiting for a /sort value from this person in this chat
 
-    if awaiting == "character":
-        known_names = db.get_distinct_character_names()
-        label = "character"
-    else:
-        known_names = db.get_distinct_series()
-        label = "series"
+    kind = awaiting["kind"]
+    known_names = db.get_distinct_character_names() if kind == "character" else db.get_distinct_series()
 
-    canonical = next((n for n in known_names if n.lower() == value.lower()), None)
-    if canonical is None:
+    added, already, not_found = [], [], []
+    for part in re.split(r"[|\n]", value):
+        part = part.strip()
+        if not part:
+            continue
+        # One word of a name is enough: "Yae" finds "Yae Miko".
+        if not any(db.text_matches_words(part, name) for name in known_names):
+            not_found.append(part)
+        elif db.add_user_filter(update.effective_user.id, kind, part):
+            added.append(part)
+        else:
+            already.append(part)
+
+    if not added and not already:
+        shown = ", ".join(html.escape(n) for n in not_found)
         await update.message.reply_text(
-            f"❓ No {label} named \"{value}\" exists. Try again, or send /sort to pick a different option."
+            f"❓ Nothing matches {shown}. Try another {kind} name, or tap Back to cancel.",
+            parse_mode=ParseMode.HTML,
         )
         return
 
-    db.set_user_filter(update.effective_user.id, awaiting, canonical)
     context.user_data.pop("awaiting_filter_type", None)
-    await update.message.reply_text(f"✅ Your constellation is now sorted by {awaiting}: {canonical}")
+    notes = []
+    if added:
+        notes.append("✅ Added: " + ", ".join(html.escape(n) for n in added))
+    if already:
+        notes.append("ℹ️ Already active: " + ", ".join(html.escape(n) for n in already))
+    if not_found:
+        notes.append("❓ No match for: " + ", ".join(html.escape(n) for n in not_found))
+
+    text, keyboard = _sort_menu(update.effective_user.id)
+    await update.message.reply_text(
+        "\n".join(notes) + "\n\n" + text, parse_mode=ParseMode.HTML, reply_markup=keyboard
+    )
 
 
 async def constellation_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3092,15 +3262,27 @@ async def remove_character_command(update: Update, context: ContextTypes.DEFAULT
 # ---------------- /spawnstatus (public) ----------------
 
 async def spawn_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # In the main group the "main"-only locks apply too, so show them there.
+    in_main_group = update.effective_chat.id == db.get_main_chat_id()
     rarities = db.list_rarities()
     locked_rarity_ids = db.get_locked_rarity_ids()
+    locked_main_rarity_ids = db.get_locked_rarity_ids(main=True) if in_main_group else set()
     events = db.get_all_events()
+
+    def status(locked_everywhere: bool, locked_here_only: bool) -> str:
+        if locked_everywhere:
+            return "🔒 Locked"
+        if locked_here_only:
+            return "🔒 Locked (main group only)"
+        return "🔓 Open"
 
     lines = ["🔐 <b>Rarity spawn status</b>\n"]
     if rarities:
         for r in rarities:
-            status = "🔒 Locked" if r["id"] in locked_rarity_ids else "🔓 Open"
-            lines.append(f"{r['name']} — {status}")
+            lines.append(
+                f"{html.escape(r['name'])} — "
+                f"{status(r['id'] in locked_rarity_ids, r['id'] in locked_main_rarity_ids)}"
+            )
     else:
         lines.append("No rarities added yet.")
 
@@ -3108,8 +3290,9 @@ async def spawn_status_command(update: Update, context: ContextTypes.DEFAULT_TYP
     lines.append("🔐 <b>Event spawn status</b>")
     if events:
         for e in events:
-            status = "🔒 Locked" if e["locked"] else "🔓 Open"
-            lines.append(f"{e['name']} — {status}")
+            lines.append(
+                f"{html.escape(e['name'])} — {status(e['locked'], in_main_group and e['locked_main'])}"
+            )
     else:
         lines.append("No events added yet.")
 
@@ -4424,49 +4607,95 @@ async def set_personality_command(update: Update, context: ContextTypes.DEFAULT_
 # rarity, that rarity's whole tier is excluded from spawning. Otherwise
 # it's treated as an event name. Multiple rarities/events can be locked
 # at the same time - each is tracked independently.
+#
+# "/lockspawn main <name>" / "/unlockspawn main <name>" only touch the MAIN
+# group (the one set with /setforcejoin); without "main" the lock applies to
+# every group. The two lists are independent.
 
-async def lock_spawn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def _split_spawn_lock_args(args):
+    """(is_main_scope, name) from the command arguments."""
+    if args and args[0].lower() == "main":
+        return True, " ".join(args[1:]).strip()
+    return False, " ".join(args).strip()
+
+
+def _find_rarity_for_lock(name: str):
+    """The rarity a typed name refers to: exact name first, then ignoring case/styled letters."""
+    rarity = db.get_rarity_by_name(name)
+    if rarity:
+        return rarity
+    wanted = _norm(name)
+    return next((r for r in db.list_rarities() if _norm(r["name"]) == wanted), None)
+
+
+def _canonical_event_name(name: str) -> str:
+    """The registered event a typed name refers to ("🛡Fighter🛡" finds "🛡𝗙𝗶𝗴𝗵𝘁𝗲𝗿🛡"),
+    or the name as typed when no registered event matches."""
+    wanted = _norm(name)
+    for event in db.get_all_events():
+        if event["name"].lower() == name.lower() or _norm(event["name"]) == wanted:
+            return event["name"]
+    return name
+
+
+async def _spawn_lock_command(update: Update, context: ContextTypes.DEFAULT_TYPE, lock: bool):
     user = update.effective_user
     if not (is_admin(user.id) or is_manager(user.id) or is_marzieh(user.id)):
         await update.message.reply_text("⛔ You're not allowed to use this command.")
         return
 
-    if not context.args:
+    command = "lockspawn" if lock else "unlockspawn"
+    main, name = _split_spawn_lock_args(context.args)
+    if not name:
         await update.message.reply_text(
-            "⚠️ Usage: <code>/lockspawn [rarity or event name]</code>", parse_mode=ParseMode.HTML
+            f"⚠️ Usage: <code>/{command} [rarity or event name]</code>\n"
+            f"Add <code>main</code> to only affect the main group: <code>/{command} main [name]</code>",
+            parse_mode=ParseMode.HTML,
         )
         return
 
-    name = " ".join(context.args)
-    rarity = db.get_rarity_by_name(name)
+    if main and db.get_main_chat_id() is None:
+        await update.message.reply_text(
+            "⚠️ The main group isn't set yet - run /setforcejoin inside it first."
+        )
+        return
+
+    scope = "in the main group" if main else "everywhere"
+    rarity = _find_rarity_for_lock(name)
     if rarity:
-        db.lock_rarity(rarity["id"])
-        await update.message.reply_text(f"🔒 Rarity <b>{rarity['name']}</b> is now locked - won't spawn.", parse_mode=ParseMode.HTML)
+        label, kind_text = f"Rarity <b>{html.escape(rarity['name'])}</b>", "its tier"
+        if lock:
+            db.lock_rarity(rarity["id"], main=main)
+        else:
+            db.unlock_rarity(rarity["id"], main=main)
+        still_locked_globally = main and not lock and db.is_rarity_locked(rarity["id"])
     else:
-        db.lock_event(name)
-        await update.message.reply_text(f"🔒 Event <b>{name}</b> is now locked - its cards won't spawn.", parse_mode=ParseMode.HTML)
+        name = _canonical_event_name(name)
+        label, kind_text = f"Event <b>{html.escape(name)}</b>", "its cards"
+        if lock:
+            db.lock_event(name, main=main)
+        else:
+            db.unlock_event(name, main=main)
+        still_locked_globally = main and not lock and db.is_event_locked(name)
+
+    if lock:
+        text = f"🔒 {label} is now locked {scope} - {kind_text} won't spawn there."
+    else:
+        text = f"🔓 {label} can spawn again {scope}."
+        if still_locked_globally:
+            text += (
+                f"\nℹ️ It is also locked for every group - use <code>/unlockspawn {html.escape(name)}</code> "
+                "(without main) to open it everywhere."
+            )
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+
+
+async def lock_spawn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _spawn_lock_command(update, context, lock=True)
 
 
 async def unlock_spawn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if not (is_admin(user.id) or is_manager(user.id) or is_marzieh(user.id)):
-        await update.message.reply_text("⛔ You're not allowed to use this command.")
-        return
-
-    if not context.args:
-        await update.message.reply_text(
-            "⚠️ Usage: <code>/unlockspawn [rarity or event name]</code>", parse_mode=ParseMode.HTML
-        )
-        return
-
-    name = " ".join(context.args)
-    rarity = db.get_rarity_by_name(name)
-    if rarity:
-        db.unlock_rarity(rarity["id"])
-        await update.message.reply_text(f"🔓 Rarity <b>{rarity['name']}</b> can spawn again.", parse_mode=ParseMode.HTML)
-    else:
-        db.unlock_event(name)
-        await update.message.reply_text(f"🔓 Event <b>{name}</b> can spawn again.", parse_mode=ParseMode.HTML)
+    await _spawn_lock_command(update, context, lock=False)
 
 
 # ---------------- Admin: /addevent & /removeevent (owner only) ----------------
@@ -4929,11 +5158,13 @@ _HELP_PLAYER = [
     (_cmd("/help"), "Show this list."),
     (_cmd("/get [Name]"),
      "Claim the currently spawned character. Just the first or last name is enough "
-     f"(daily limit: {config.DAILY_CAPTURE_LIMIT}, resets at midnight)."),
+     f"(daily limit: {config.DAILY_CAPTURE_LIMIT}, resets at midnight Iran time)."),
     (_cmd("/constellation"),
      "See your own collection, grouped by series, with a button to browse all your character photos."),
     (_cmd("/fav [ID]"), "Pick your favorite card - it becomes the picture shown on your /constellation."),
-    (_cmd("/sort"), "Filter what your constellation shows: by character, series, or rarity."),
+    (_cmd("/sort"),
+     "Filter what your constellation shows by character, series, rarity and event - stack as many "
+     "filters as you like (one word of a name is enough)."),
     (_cmd("/miniapp"), "Open the Waifu Market Mini App."),
     (_cmd("/check [ID]"), "See a character's photo, full details, who added it, and how many players own it."),
     (_cmd("/rarities"), "List all rarity tiers and how many of each you own."),
@@ -4948,7 +5179,8 @@ _HELP_PLAYER = [
     (_cmd("/gift [ID]"),
      "Reply to someone with this to give them one of your cards (asks for confirmation first)."),
     (_cmd("/spawnstatus"), "See which rarities and events are currently locked from spawning."),
-    (_cmd("/dart"), f"Throw a dart for a chance to win currency (up to {config.DAILY_DART_LIMIT} throws/day)."),
+    (_cmd("/dart"),
+     f"Throw a dart for a chance to win currency (up to {config.DAILY_DART_LIMIT} throws/day, resets at midnight Iran time)."),
     (_cmd("/inv"), "Check your currency balance."),
     (_cmd("/vypay [amount]"), "Reply to someone with this to send them some of your currency."),
     (_cmd("/invite"),
@@ -5009,9 +5241,11 @@ _HELP_MODERATION = [
      "Reply to a player (or give their ID) to ban them - permanent if no days given."),
     (_cmd("/unban", "/unban [user ID]"), "Reply to a banned player (or give their ID) to lift their ban."),
     (_cmd("/forcespawn"), "Instantly spawn a random character in the current group."),
-    (_cmd("/lockspawn [rarity or event]"),
-     "Stop a rarity tier or event's cards from spawning. Multiple locks can be active at once."),
-    (_cmd("/unlockspawn [rarity or event]"), "Re-allow a locked rarity or event to spawn again."),
+    (_cmd("/lockspawn [rarity or event]", "/lockspawn main [rarity or event]"),
+     "Stop a rarity tier or event's cards from spawning. Multiple locks can be active at once. "
+     "With <code>main</code> the lock only applies to the main group (the /setforcejoin one)."),
+    (_cmd("/unlockspawn [rarity or event]", "/unlockspawn main [rarity or event]"),
+     "Re-allow a locked rarity or event to spawn again (with <code>main</code>: only in the main group)."),
     (_cmd("/give [ID]", "/give [amount] vy"),
      'Reply to someone with this to give them a card by ID, or currency (add "vy" after the amount).'),
     (_cmd("/player"),
@@ -5217,6 +5451,7 @@ def main():
     app.add_handler(CommandHandler("sort", sort_command))
     app.add_handler(CallbackQueryHandler(sort_menu_callback, pattern=r"^sortmenu:"))
     app.add_handler(CallbackQueryHandler(sort_value_callback, pattern=r"^sortval:"))
+    app.add_handler(CallbackQueryHandler(sort_remove_callback, pattern=r"^sortdel:\d+$"))
     app.add_handler(CallbackQueryHandler(constellation_page_callback, pattern=r"^conspage:"))
     app.add_handler(CommandHandler("gift", gift_command))
     app.add_handler(CallbackQueryHandler(gift_callback, pattern=r"^gift:"))
@@ -5308,6 +5543,14 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, capture_edit_character_input), group=4)
 
     logger.info("Bot starting...")
+    KNOWN_COMMANDS.update(
+        command
+        for handlers in app.handlers.values()
+        for handler in handlers
+        if isinstance(handler, CommandHandler)
+        for command in handler.commands
+    )
+
     app.run_polling()
 
 

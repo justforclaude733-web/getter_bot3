@@ -180,10 +180,15 @@ def get_profile(user: dict = Depends(current_user)):
 
 @api_app.get("/api/profile/filter")
 def get_profile_filter(user: dict = Depends(current_user)):
-    row = db.get_user_filter(user["id"])
-    if not row or not row["filter_type"] or not row["filter_value"]:
-        return {"filter_type": None, "filter_value": None}
-    return {"filter_type": row["filter_type"], "filter_value": row["filter_value"]}
+    """filter_type/filter_value = the first active filter (what the picker shows);
+    `filters` = every filter the player stacked with /sort in the bot."""
+    filters = [
+        {"filter_type": f["filter_type"], "filter_value": f["filter_value"]}
+        for f in db.get_user_filters(user["id"])
+    ]
+    if not filters:
+        return {"filter_type": None, "filter_value": None, "filters": []}
+    return {**filters[0], "filters": filters}
 
 
 @api_app.get("/api/profile/filter-options")
@@ -210,7 +215,7 @@ def set_profile_filter(payload: ProfileFilterRequest, user: dict = Depends(curre
         db.clear_user_filter(user["id"])
         return {"ok": True, "filter_type": None, "filter_value": None}
 
-    if payload.filter_type not in ("character", "series", "rarity"):
+    if payload.filter_type not in db.FILTER_TYPES:
         raise HTTPException(status_code=400, detail="invalid_filter_type")
 
     db.set_user_filter(user["id"], payload.filter_type, payload.filter_value)

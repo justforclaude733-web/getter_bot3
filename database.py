@@ -6,8 +6,10 @@ Uses SQLite (single file, no server needed - perfect for Termux).
 import sqlite3
 import random
 import json
+import re
 import unicodedata
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 from config import (
     DB_PATH, DEFAULT_CHARACTER_WEIGHT, FIGHTER_EVENT_NAME, ELEMENTS,
@@ -16,6 +18,18 @@ from config import (
     ARENA_NPC_IDS, DAILY_TASK_BONUS, PREMIUM_DAILY_TASK_BONUS,
     PRICE_CHECK_DEDUP_WINDOW_SECONDS,
 )
+
+
+try:
+    IRAN_TZ = ZoneInfo("Asia/Tehran")
+except Exception:  # tz database missing on a minimal server image
+    IRAN_TZ = timezone(timedelta(hours=3, minutes=30))  # Iran has no DST since 2022
+
+
+def iran_today() -> str:
+    """Today's date (YYYY-MM-DD) in Iran. Daily limits (captures, darts) roll over
+    at 00:00 Iran time, not at the server's (UTC) midnight."""
+    return datetime.now(IRAN_TZ).date().isoformat()
 
 
 def get_connection():
@@ -185,6 +199,18 @@ def init_db():
         )
     """)
 
+    # /sort: any number of filters per player (character / series / rarity / event).
+    # Values of the same type are OR-ed, different types are AND-ed - see
+    # _card_passes_filters(). Replaces the old one-row-per-player user_filters.
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS user_filter_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            filter_type TEXT NOT NULL,
+            filter_value TEXT NOT NULL,
+            UNIQUE (user_id, filter_type, filter_value)
+        )
+    """)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS locked_rarities (
             rarity_id INTEGER PRIMARY KEY
@@ -193,6 +219,19 @@ def init_db():
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS locked_events (
+            event_name TEXT PRIMARY KEY
+        )
+    """)
+
+    # Locks that only apply to the main group (the /setforcejoin group) -
+    # set with "/lockspawn main ..." - on top of the global locks above.
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS locked_rarities_main (
+            rarity_id INTEGER PRIMARY KEY
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS locked_events_main (
             event_name TEXT PRIMARY KEY
         )
     """)
@@ -208,6 +247,17 @@ def init_db():
             name TEXT PRIMARY KEY
         )
     """)
+
+    # /sort filters used to live in user_filters (one per player) - copy them over once.
+    cur.execute("SELECT 1 FROM schema_migrations WHERE name = 'user_filter_items_v1'")
+    if not cur.fetchone():
+        cur.execute("""
+            INSERT OR IGNORE INTO user_filter_items (user_id, filter_type, filter_value)
+            SELECT user_id, filter_type, filter_value FROM user_filters
+            WHERE filter_type IS NOT NULL AND filter_value IS NOT NULL AND filter_value <> ''
+        """)
+        cur.execute("INSERT INTO schema_migrations (name) VALUES ('user_filter_items_v1')")
+        conn.commit()
 
     # ---------------- /new channel publisher ----------------
     # Stores the last channel target so the owner only has to provide it
@@ -503,6 +553,23 @@ def init_db():
             cur.execute(f"ALTER TABLE bot_users ADD COLUMN {col_def}")
         except sqlite3.OperationalError:
             pass
+
+    # defensive migration: started_at = when the player first ran /start. Invite
+    # rewards key off THIS, not off the row merely existing: other code (the
+    # interaction capture that runs before /start, Mini App login) creates the
+    # bot_users row first, which made every invited friend look "not new" and
+    # silently skipped the invite reward + count.
+    try:
+        cur.execute("ALTER TABLE bot_users ADD COLUMN started_at TEXT")
+    except sqlite3.OperationalError:
+        pass
+    cur.execute("SELECT 1 FROM schema_migrations WHERE name = 'bot_users_started_at_v1'")
+    if not cur.fetchone():
+        # Everyone who exists right now counts as already started.
+        cur.execute("UPDATE bot_users SET started_at = COALESCE(first_seen_at, ?) WHERE started_at IS NULL",
+                    (datetime.utcnow().isoformat(),))
+        cur.execute("INSERT INTO schema_migrations (name) VALUES ('bot_users_started_at_v1')")
+        conn.commit()
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS referrals (
@@ -942,7 +1009,7 @@ def set_archive_message_id(character_id: int, message_id: int):
     conn.close()
 
 
-def pick_random_character():
+def pick_random_character(chat_id: int = None):
     """
     Two-stage weighted pick:
       1) Pick a rarity TIER using rarity weight (a tier's total odds don't
@@ -950,8 +1017,11 @@ def pick_random_character():
       2) Pick uniformly among the characters within that tier.
     Characters with no rarity assigned form their own "Unranked" tier,
     using DEFAULT_CHARACTER_WEIGHT as that tier's overall weight.
-    Locked rarities and locked events are excluded entirely.
+    Locked rarities and locked events are excluded entirely - the global locks
+    everywhere, and the "main" locks too when `chat_id` is the main group.
     """
+    is_main_group = chat_id is not None and chat_id == get_main_chat_id()
+
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("""
@@ -967,6 +1037,12 @@ def pick_random_character():
 
     cur.execute("SELECT event_name FROM locked_events")
     locked_events = {r["event_name"].lower() for r in cur.fetchall()}
+
+    if is_main_group:
+        cur.execute("SELECT rarity_id FROM locked_rarities_main")
+        locked_rarity_ids |= {r["rarity_id"] for r in cur.fetchall()}
+        cur.execute("SELECT event_name FROM locked_events_main")
+        locked_events |= {r["event_name"].lower() for r in cur.fetchall()}
 
     conn.close()
 
@@ -997,36 +1073,58 @@ def pick_random_character():
 
 # ---------------- Spawn locks (rarities & events) ----------------
 
-def lock_rarity(rarity_id: int):
+def get_main_chat_id():
+    """Chat id of the main group (the one set with /setforcejoin), or None."""
+    settings = get_force_join_settings()
+    return settings["chat_id"] if settings else None
+
+
+def lock_rarity(rarity_id: int, main: bool = False):
+    table = "locked_rarities_main" if main else "locked_rarities"
     conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("INSERT OR IGNORE INTO locked_rarities (rarity_id) VALUES (?)", (rarity_id,))
+    conn.execute(f"INSERT OR IGNORE INTO {table} (rarity_id) VALUES (?)", (rarity_id,))
     conn.commit()
     conn.close()
 
 
-def unlock_rarity(rarity_id: int):
+def unlock_rarity(rarity_id: int, main: bool = False):
+    table = "locked_rarities_main" if main else "locked_rarities"
     conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM locked_rarities WHERE rarity_id = ?", (rarity_id,))
+    conn.execute(f"DELETE FROM {table} WHERE rarity_id = ?", (rarity_id,))
     conn.commit()
     conn.close()
 
 
-def lock_event(event_name: str):
+def lock_event(event_name: str, main: bool = False):
+    table = "locked_events_main" if main else "locked_events"
     conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("INSERT OR IGNORE INTO locked_events (event_name) VALUES (?)", (event_name,))
+    conn.execute(f"INSERT OR IGNORE INTO {table} (event_name) VALUES (?)", (event_name,))
     conn.commit()
     conn.close()
 
 
-def unlock_event(event_name: str):
+def unlock_event(event_name: str, main: bool = False):
+    table = "locked_events_main" if main else "locked_events"
     conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM locked_events WHERE LOWER(event_name) = LOWER(?)", (event_name,))
+    conn.execute(f"DELETE FROM {table} WHERE LOWER(event_name) = LOWER(?)", (event_name,))
     conn.commit()
     conn.close()
+
+
+def is_rarity_locked(rarity_id: int, main: bool = False) -> bool:
+    table = "locked_rarities_main" if main else "locked_rarities"
+    conn = get_connection()
+    row = conn.execute(f"SELECT 1 FROM {table} WHERE rarity_id = ?", (rarity_id,)).fetchone()
+    conn.close()
+    return row is not None
+
+
+def is_event_locked(event_name: str, main: bool = False) -> bool:
+    table = "locked_events_main" if main else "locked_events"
+    conn = get_connection()
+    row = conn.execute(f"SELECT 1 FROM {table} WHERE LOWER(event_name) = LOWER(?)", (event_name,)).fetchone()
+    conn.close()
+    return row is not None
 
 
 # ---------------- Events registry ----------------
@@ -1063,6 +1161,7 @@ def remove_event(event_name: str) -> bool:
 
     cur.execute("DELETE FROM events WHERE LOWER(event_name) = LOWER(?)", (event_name,))
     cur.execute("DELETE FROM locked_events WHERE LOWER(event_name) = LOWER(?)", (event_name,))
+    cur.execute("DELETE FROM locked_events_main WHERE LOWER(event_name) = LOWER(?)", (event_name,))
     conn.commit()
     conn.close()
     return True
@@ -1090,15 +1189,21 @@ def get_event_by_name(event_name: str):
 
 
 def get_all_events():
-    """All registered events with their locked status, for /spawnstatus."""
+    """All registered events with their locked status, for /spawnstatus.
+    `locked` = locked everywhere; `locked_main` = locked in the main group only."""
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("SELECT event_name FROM events ORDER BY event_name COLLATE NOCASE")
     names = [r["event_name"] for r in cur.fetchall()]
     cur.execute("SELECT event_name FROM locked_events")
     locked = {r["event_name"].lower() for r in cur.fetchall()}
+    cur.execute("SELECT event_name FROM locked_events_main")
+    locked_main = {r["event_name"].lower() for r in cur.fetchall()}
     conn.close()
-    return [{"name": n, "locked": n.lower() in locked} for n in names]
+    return [
+        {"name": n, "locked": n.lower() in locked, "locked_main": n.lower() in locked_main}
+        for n in names
+    ]
 
 
 def count_owners(character_id: int):
@@ -1176,12 +1281,7 @@ def get_user_inventory(user_id: int, apply_filter: bool = True):
     conn = get_connection()
     cur = conn.cursor()
 
-    filter_row = None
-    if apply_filter:
-        cur.execute("SELECT filter_type, filter_value FROM user_filters WHERE user_id = ?", (user_id,))
-        filter_row = cur.fetchone()
-
-    base_query = """
+    cur.execute("""
         SELECT characters.id, characters.name, characters.series, characters.image_file_id,
                characters.media_type, characters.event_name,
                characters.added_by_user_id, characters.added_by_username,
@@ -1190,26 +1290,17 @@ def get_user_inventory(user_id: int, apply_filter: bool = True):
         JOIN characters ON user_characters.character_id = characters.id
         LEFT JOIN rarities ON characters.rarity_id = rarities.id
         WHERE user_characters.user_id = ?
-    """
-    params = [user_id]
-
-    if filter_row and filter_row["filter_type"] and filter_row["filter_value"]:
-        ftype, fvalue = filter_row["filter_type"], filter_row["filter_value"]
-        if ftype == "character":
-            base_query += " AND characters.name = ?"
-            params.append(fvalue)
-        elif ftype == "series":
-            base_query += " AND characters.series = ?"
-            params.append(fvalue)
-        elif ftype == "rarity":
-            base_query += " AND rarities.name = ?"
-            params.append(fvalue)
-
-    base_query += " ORDER BY user_characters.obtained_at DESC"
-
-    cur.execute(base_query, params)
+        ORDER BY user_characters.obtained_at DESC
+    """, (user_id,))
     rows = cur.fetchall()
     conn.close()
+
+    if apply_filter:
+        grouped = {}
+        for f in get_user_filters(user_id):
+            grouped.setdefault(f["filter_type"], []).append(f["filter_value"])
+        if grouped:
+            rows = [row for row in rows if _card_passes_filters(row, grouped)]
     return rows
 
 
@@ -1362,33 +1453,137 @@ def add_chat_message(user_id: int, character_id: int, sender: str, content: str)
 
 # ---------------- Sort / filter preference ----------------
 
-def get_user_filter(user_id: int):
+FILTER_TYPES = ("character", "series", "rarity", "event")
+_FILTER_ORDER_SQL = (
+    "CASE filter_type WHEN 'character' THEN 0 WHEN 'series' THEN 1 WHEN 'rarity' THEN 2 ELSE 3 END, id"
+)
+
+
+def _word_set(text) -> set:
+    return set(re.findall(r"\w+", _normalize_search_text(text)))
+
+
+def text_matches_words(query: str, full_text: str) -> bool:
+    """True if every word of `query` is a word of `full_text` (case-insensitive, styled
+    Unicode folded): "Yae" and "Yae Miko" both match the character "Yae Miko", and
+    "Miko" matches it too. A query with no letters/digits never matches."""
+    words = _word_set(query)
+    return bool(words) and words <= _word_set(full_text)
+
+
+def _card_passes_filters(row, grouped: dict) -> bool:
+    """`grouped` maps filter type -> [values]. A card passes when, for EVERY type
+    present, it matches AT LEAST ONE of that type's values."""
+    for ftype, values in grouped.items():
+        if ftype == "character":
+            ok = any(text_matches_words(v, row["name"]) for v in values)
+        elif ftype == "series":
+            ok = any(text_matches_words(v, row["series"]) for v in values)
+        elif ftype == "rarity":
+            card_rarity = _normalize_search_text(row["rarity_name"])
+            ok = bool(card_rarity) and any(_normalize_search_text(v) == card_rarity for v in values)
+        elif ftype == "event":
+            card_event = _normalize_search_text(row["event_name"])
+            ok = bool(card_event) and any(_normalize_search_text(v) == card_event for v in values)
+        else:
+            ok = True  # unknown type: ignore rather than hide everything
+        if not ok:
+            return False
+    return True
+
+
+def get_user_filters(user_id: int):
+    """Every active /sort filter of this player: rows with id, filter_type, filter_value."""
     conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("SELECT filter_type, filter_value FROM user_filters WHERE user_id = ?", (user_id,))
-    row = cur.fetchone()
+    rows = conn.execute(
+        f"SELECT id, filter_type, filter_value FROM user_filter_items WHERE user_id = ? ORDER BY {_FILTER_ORDER_SQL}",
+        (user_id,),
+    ).fetchall()
     conn.close()
-    return row
+    return rows
 
 
-def set_user_filter(user_id: int, filter_type: str, filter_value: str):
+def _find_filter_id(cur, user_id: int, filter_type: str, filter_value: str):
+    wanted = _normalize_search_text(filter_value)
+    cur.execute(
+        "SELECT id, filter_value FROM user_filter_items WHERE user_id = ? AND filter_type = ?",
+        (user_id, filter_type),
+    )
+    for row in cur.fetchall():
+        if _normalize_search_text(row["filter_value"]) == wanted:
+            return row["id"]
+    return None
+
+
+def add_user_filter(user_id: int, filter_type: str, filter_value: str) -> bool:
+    """Adds one filter. Returns False if the player already has that exact filter."""
+    filter_value = filter_value.strip()
     conn = get_connection()
     cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO user_filters (user_id, filter_type, filter_value)
-        VALUES (?, ?, ?)
-        ON CONFLICT(user_id) DO UPDATE SET filter_type = excluded.filter_type, filter_value = excluded.filter_value
-    """, (user_id, filter_type, filter_value))
+    try:
+        cur.execute("BEGIN IMMEDIATE")
+        if _find_filter_id(cur, user_id, filter_type, filter_value) is not None:
+            return False
+        cur.execute(
+            "INSERT INTO user_filter_items (user_id, filter_type, filter_value) VALUES (?, ?, ?)",
+            (user_id, filter_type, filter_value),
+        )
+        conn.commit()
+        return True
+    finally:
+        conn.close()
+
+
+def toggle_user_filter(user_id: int, filter_type: str, filter_value: str) -> bool:
+    """Adds the filter if the player doesn't have it, removes it if they do.
+    Returns True when it is active afterwards."""
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("BEGIN IMMEDIATE")
+        existing_id = _find_filter_id(cur, user_id, filter_type, filter_value)
+        if existing_id is not None:
+            cur.execute("DELETE FROM user_filter_items WHERE id = ?", (existing_id,))
+            conn.commit()
+            return False
+        cur.execute(
+            "INSERT INTO user_filter_items (user_id, filter_type, filter_value) VALUES (?, ?, ?)",
+            (user_id, filter_type, filter_value.strip()),
+        )
+        conn.commit()
+        return True
+    finally:
+        conn.close()
+
+
+def remove_user_filter(user_id: int, filter_id: int) -> bool:
+    conn = get_connection()
+    cur = conn.execute("DELETE FROM user_filter_items WHERE id = ? AND user_id = ?", (filter_id, user_id))
     conn.commit()
+    removed = cur.rowcount > 0
     conn.close()
+    return removed
 
 
 def clear_user_filter(user_id: int):
     conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM user_filters WHERE user_id = ?", (user_id,))
+    conn.execute("DELETE FROM user_filter_items WHERE user_id = ?", (user_id,))
     conn.commit()
     conn.close()
+
+
+# --- single-filter API kept for the Mini App (/api/profile/filter) ---
+
+def get_user_filter(user_id: int):
+    """The player's first filter (or None). Only the Mini App's single-filter picker uses this."""
+    rows = get_user_filters(user_id)
+    return rows[0] if rows else None
+
+
+def set_user_filter(user_id: int, filter_type: str, filter_value: str):
+    """Replaces ALL of the player's filters with this one (the Mini App's single-filter picker)."""
+    clear_user_filter(user_id)
+    add_user_filter(user_id, filter_type, filter_value)
 
 
 def get_distinct_character_names():
@@ -2153,7 +2348,7 @@ def is_user_muted(chat_id: int, user_id: int):
 # ---------------- Daily capture limit ----------------
 
 def get_daily_capture_count(user_id: int):
-    today = datetime.now().date().isoformat()
+    today = iran_today()
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
@@ -2166,7 +2361,7 @@ def get_daily_capture_count(user_id: int):
 
 
 def increment_daily_capture(user_id: int):
-    today = datetime.now().date().isoformat()
+    today = iran_today()
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("""
@@ -2251,23 +2446,31 @@ def register_bot_user_if_new(user_id: int, username: str = None, first_name: str
     time this is ever called for that user (a genuinely new player) -
     False if they'd already started the bot before, so re-running /start
     (e.g. via someone else's invite link) never counts as a new referral.
+    "Started" is bot_users.started_at, which only this function sets - the
+    row itself may already exist (upsert_user_profile creates it).
     """
+    now = datetime.utcnow().isoformat()
     conn = get_connection()
     cur = conn.cursor()
-    cur.execute("SELECT 1 FROM bot_users WHERE user_id = ?", (user_id,))
-    is_new = cur.fetchone() is None
+    try:
+        cur.execute("BEGIN IMMEDIATE")
+        cur.execute("SELECT started_at FROM bot_users WHERE user_id = ?", (user_id,))
+        row = cur.fetchone()
+        is_new = row is None or row["started_at"] is None
 
-    cur.execute("""
-        INSERT INTO bot_users (user_id, first_seen_at, username, first_name, last_name)
-        VALUES (?, ?, ?, ?, ?)
-        ON CONFLICT(user_id) DO UPDATE SET
-            username = COALESCE(excluded.username, bot_users.username),
-            first_name = COALESCE(excluded.first_name, bot_users.first_name),
-            last_name = COALESCE(excluded.last_name, bot_users.last_name)
-    """, (user_id, datetime.utcnow().isoformat(), username, first_name, last_name))
-    conn.commit()
-    conn.close()
-    return is_new
+        cur.execute("""
+            INSERT INTO bot_users (user_id, first_seen_at, started_at, username, first_name, last_name)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                started_at = COALESCE(bot_users.started_at, excluded.started_at),
+                username = COALESCE(excluded.username, bot_users.username),
+                first_name = COALESCE(excluded.first_name, bot_users.first_name),
+                last_name = COALESCE(excluded.last_name, bot_users.last_name)
+        """, (user_id, now, now, username, first_name, last_name))
+        conn.commit()
+        return is_new
+    finally:
+        conn.close()
 
 
 def upsert_user_profile(user_id: int, username: str = None, first_name: str = None, last_name: str = None):
@@ -2499,7 +2702,7 @@ def transfer_currency(sender_id: int, receiver_id: int, amount: int):
 # ---------------- Daily dart limit ----------------
 
 def get_daily_dart_count(user_id: int) -> int:
-    today = datetime.now().date().isoformat()
+    today = iran_today()
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
@@ -2512,7 +2715,7 @@ def get_daily_dart_count(user_id: int) -> int:
 
 
 def increment_daily_dart(user_id: int) -> int:
-    today = datetime.now().date().isoformat()
+    today = iran_today()
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("""
@@ -2805,6 +3008,7 @@ def wipe_all_events():
 
     cur.execute("DELETE FROM events")
     cur.execute("DELETE FROM locked_events")
+    cur.execute("DELETE FROM locked_events_main")
     conn.commit()
     conn.close()
 
@@ -3194,10 +3398,12 @@ def claim_new_vy_button(button_id: int, user_id: int, amount: int):
 
 # ---------------- Spawn lock status ----------------
 
-def get_locked_rarity_ids():
+def get_locked_rarity_ids(main: bool = False):
+    """Rarity ids locked everywhere - or, with main=True, locked in the main group only."""
+    table = "locked_rarities_main" if main else "locked_rarities"
     conn = get_connection()
     cur = conn.cursor()
-    cur.execute("SELECT rarity_id FROM locked_rarities")
+    cur.execute(f"SELECT rarity_id FROM {table}")
     ids = {r["rarity_id"] for r in cur.fetchall()}
     conn.close()
     return ids
