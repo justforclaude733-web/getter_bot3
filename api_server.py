@@ -27,7 +27,7 @@ import logging
 import time
 from datetime import datetime
 from typing import Optional
-from urllib.parse import parse_qsl
+from urllib.parse import parse_qsl, urlparse
 
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Response
@@ -45,15 +45,22 @@ api_app = FastAPI(title="Waifu Market API")
 
 # Only this Telegram user id is allowed to create new tasks from the
 # Mini App's Task tab.
-TASK_ADMIN_ID = 8392724333
+TASK_ADMIN_ID = config.ADMIN_ID
 
 # The Mini App is served from a different domain (Vercel/Netlify/etc.),
 # so the browser needs CORS allowed explicitly. Once you have the Mini
 # App's real URL, set MINI_APP_URL in your environment so this locks
 # down to just that origin instead of "*".
+def _cors_origin(url: str) -> str:
+    """CORS wants a bare origin (https://host), not a full URL - a trailing
+    slash or path in MINI_APP_URL would otherwise make every request fail."""
+    parsed = urlparse(url)
+    return f"{parsed.scheme}://{parsed.netloc}" if parsed.scheme and parsed.netloc else url.rstrip("/")
+
+
 api_app.add_middleware(
     CORSMiddleware,
-    allow_origins=[config.MINI_APP_URL] if config.MINI_APP_URL else ["*"],
+    allow_origins=[_cors_origin(config.MINI_APP_URL)] if config.MINI_APP_URL else ["*"],
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )

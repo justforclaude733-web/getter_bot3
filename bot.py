@@ -29,12 +29,12 @@ from telegram import (
     Bot,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    InputMediaPhoto,
     InlineQueryResultCachedPhoto,
     InlineQueryResultCachedVideo,
     WebAppInfo,
 )
 from telegram.constants import ParseMode
+from telegram.error import TelegramError
 from telegram.ext import (
     ApplicationBuilder,
     ApplicationHandlerStop,
@@ -51,7 +51,6 @@ import config
 import database as db
 import economy
 import memories
-from ai_client import AIClient, AIClientError
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -82,26 +81,44 @@ PENDING_FILE_RESTORE = set()
 # In-memory wizard state for /new. The published posts themselves are
 # persisted in SQLite; only the admin's unfinished composition lives here.
 PENDING_NEW_FLOWS = {}
-NEW_AI_CLIENT = AIClient(config)
 
-# User who owns the currently processed update. This is used to bind
-# callback buttons on bot-generated messages to the user who triggered them.
+# The user and chat of the update being processed right now. Every bot message
+# that carries personal buttons is bound to this user (see below).
 _CURRENT_UPDATE_USER_ID = ContextVar("current_update_user_id", default=None)
+_CURRENT_UPDATE_CHAT_ID = ContextVar("current_update_chat_id", default=None)
 _PERSONAL_BUTTON_GUARD_INSTALLED = False
 
+# ---- Personal buttons -------------------------------------------------------
+# Rule: a button can only be pressed by the user whose action made the bot post
+# it. Exactly two kinds of buttons are exempt:
+#   * PUBLIC: the buttons of already-published /new posts - meant for everyone.
+#   * SELF-GUARDED: buttons whose own handler already checks the user (the
+#     force-join check carries the user id in its callback_data).
+# Everything else is bound to its owner automatically - see
+# _install_personal_button_guard() and _block_unowned_callbacks().
+PUBLIC_CALLBACK_PREFIXES = ("new:lang:", "new:use:")
+SELF_GUARDED_CALLBACK_PREFIXES = ("forcejoin:check:",)
+_EXEMPT_CALLBACK_PREFIXES = PUBLIC_CALLBACK_PREFIXES + SELF_GUARDED_CALLBACK_PREFIXES
 
-def _markup_has_callback_buttons(reply_markup) -> bool:
+
+def _markup_has_personal_buttons(reply_markup) -> bool:
+    """True if the keyboard has at least one callback button that must be personal."""
     if not reply_markup or not getattr(reply_markup, "inline_keyboard", None):
         return False
     return any(
         getattr(button, "callback_data", None) is not None
+        and not str(button.callback_data).startswith(_EXEMPT_CALLBACK_PREFIXES)
         for row in reply_markup.inline_keyboard
         for button in row
     )
 
 
 def _install_personal_button_guard():
-    """Persist ownership for every callback-button message sent by the bot."""
+    """Remember, for every message the bot sends with personal buttons, which
+    user's action triggered it. Only messages posted into the SAME chat as the
+    triggering update are bound: anything the bot sends elsewhere (a /send
+    submission forwarded to the owner, a post published to a channel, a DM)
+    is meant for someone else and stays unbound."""
     global _PERSONAL_BUTTON_GUARD_INSTALLED
     if _PERSONAL_BUTTON_GUARD_INSTALLED:
         return
@@ -110,10 +127,10 @@ def _install_personal_button_guard():
         reply_markup = kwargs.get("reply_markup")
         result = await original(bot_self, *args, **kwargs)
         owner_id = _CURRENT_UPDATE_USER_ID.get()
-        if owner_id and _markup_has_callback_buttons(reply_markup) and result is not None:
+        if owner_id and result is not None and _markup_has_personal_buttons(reply_markup):
             chat_id = getattr(getattr(result, "chat", None), "id", None)
             message_id = getattr(result, "message_id", None)
-            if chat_id is not None and message_id is not None:
+            if chat_id is not None and message_id is not None and chat_id == _CURRENT_UPDATE_CHAT_ID.get():
                 try:
                     db.set_personalized_button_owner(chat_id, message_id, owner_id)
                 except Exception:
@@ -131,36 +148,54 @@ def _install_personal_button_guard():
     _PERSONAL_BUTTON_GUARD_INSTALLED = True
 
 
+async def _ignore_edited_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Editing an old message must not re-run a command (e.g. /dart) or count as a
+    new group message for the spam/spawn counters - nothing in this bot needs edits."""
+    if update.edited_message is not None or update.edited_channel_post is not None:
+        raise ApplicationHandlerStop
+
+
+async def _bind_update_context(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """First handler to run for every update: records who/where it came from so
+    the messages the bot sends while handling it can be bound to that user."""
+    user = update.effective_user
+    chat = update.effective_chat
+    _CURRENT_UPDATE_USER_ID.set(user.id if user else None)
+    _CURRENT_UPDATE_CHAT_ID.set(chat.id if chat else None)
+
+
 async def _block_unowned_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Allow a callback button only to the user who triggered its bot message."""
+    """Let a callback button through only for the user it was made for."""
     query = update.callback_query
-    if query is None or query.from_user is None:
+    if query is None or query.from_user is None or query.message is None:
+        return
+    if (query.data or "").startswith(_EXEMPT_CALLBACK_PREFIXES):
         return
 
-    # The force-join check is intentionally public so users can verify membership.
-    if (query.data or "").startswith("forcejoin:check:"):
-        try:
-            target_id = int((query.data or "").split(":", 2)[2])
-        except (ValueError, IndexError):
-            await query.answer("⚠️ Invalid button.", show_alert=True)
-            raise ApplicationHandlerStop
-        if query.from_user.id != target_id:
-            await query.answer("⛔ This button belongs to another user.", show_alert=True)
-            raise ApplicationHandlerStop
-        return
-
-    message = query.message
-    if message is None:
-        return
-
-    owner_id = db.get_personalized_button_owner(message.chat.id, message.message_id)
+    owner_id = db.get_personalized_button_owner(query.message.chat.id, query.message.message_id)
     if owner_id is None:
-        # Old/external messages without a registered owner are left alone.
+        # Messages sent before this guard existed (or in other chats) have no owner - leave them alone.
         return
 
     if query.from_user.id != owner_id:
         await query.answer("⛔ This button belongs to another user.", show_alert=True)
         raise ApplicationHandlerStop
+
+
+async def _consume_buttons(query) -> bool:
+    """Strips a confirm/cancel keyboard BEFORE acting on the tap. If the buttons
+    are already gone (a double tap, or two taps queued up), this returns False and
+    the caller must do nothing - otherwise one card could be sold/gifted twice."""
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+        return True
+    except TelegramError:
+        return False
+
+
+def _mention(user_id: int, name: str = None) -> str:
+    """Clickable user name for HTML messages, safe against names containing < > &."""
+    return f'<a href="tg://user?id={user_id}">{html.escape(name or "Player")}</a>'
 
 
 # ---------------- Helpers ----------------
@@ -428,7 +463,6 @@ async def _capture_user_info(update: Update, context: ContextTypes.DEFAULT_TYPE)
     usage is captured separately in api_server.py's current_user(), since
     it never comes through here.
     """
-    _CURRENT_UPDATE_USER_ID.set(update.effective_user.id if update.effective_user else None)
     user = update.effective_user
     if user is None or user.is_bot:
         return
@@ -604,6 +638,11 @@ async def get_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     guess = " ".join(context.args).strip()
     character = db.get_character(pending_id)
+    if not character:
+        # The spawned character was deleted while it was waiting to be claimed.
+        db.clear_pending_spawn(chat_id)
+        await update.message.reply_text("🎇𝛵here's 𝛈𝛐 𝝇haracter to get right now.")
+        return
 
     if not name_matches(guess, character["name"]):
         await update.message.reply_text("❌ Wrong name, try again!")
@@ -626,7 +665,7 @@ async def get_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.exception("Failed to DM milestone message to %s", user.id)
 
     rarity_text = character["rarity_name"] if character["rarity_name"] else "Unranked"
-    claimer_name = f'<a href="tg://user?id={user.id}">{user.first_name}</a>'
+    claimer_name = _mention(user.id, user.first_name)
 
     text = (
         f"✨ <b>{claimer_name}</b> has got a celestial relic!\n\n"
@@ -761,15 +800,19 @@ async def send_constellation_summary(context: ContextTypes.DEFAULT_TYPE, target_
 
 async def constellation_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
 
     _, owner_id_str, page_str = query.data.split(":")
     owner_id = int(owner_id_str)
     page = int(page_str)
 
+    if query.from_user.id != owner_id:
+        await query.answer("⛔ This button belongs to another user.", show_alert=True)
+        return
+    await query.answer()
+
     try:
         chat = await context.bot.get_chat(owner_id)
-        display_name = f'<a href="tg://user?id={owner_id}">{chat.first_name}</a>'
+        display_name = _mention(owner_id, chat.first_name)
     except Exception:
         stored_name = db.get_username_for_user(owner_id)
         display_name = stored_name or "Player"
@@ -789,7 +832,7 @@ async def constellation_page_callback(update: Update, context: ContextTypes.DEFA
 async def constellation_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Standalone command to view your own constellation, posted right in the chat it was called from."""
     user = update.effective_user
-    display_name = f'<a href="tg://user?id={user.id}">{user.first_name}</a>'
+    display_name = _mention(user.id, user.first_name)
     chat_id = update.effective_chat.id
 
     await send_constellation_summary(context, chat_id, user.id, display_name)
@@ -930,33 +973,45 @@ async def dart_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     dart_msg = await context.bot.send_dice(chat_id=chat_id, emoji="🎯")
-    await asyncio.sleep(4)  # let the throw animation play out before revealing the result
-
-    reward = dart_reward(dart_msg.dice.value)
+    # Count the throw right away, then reveal the result in the background:
+    # sleeping inside the handler would hold up every other update for 4 seconds.
     used_today = db.increment_daily_dart(user.id)
-    remaining = dart_limit - used_today
+    context.application.create_task(
+        _reveal_dart_result(context.bot, chat_id, update.message.message_id, user, dart_msg.dice.value, dart_limit - used_today)
+    )
 
-    name_link = f'<a href="tg://user?id={user.id}">{user.first_name}</a>'
 
-    if reward > 0:
-        balance = db.add_currency(user.id, reward)
-        text = (
-            f"{name_link}\n\n"
-            f"🎉 𝐘𝐨𝐮 𝐰𝐨𝐧!\n"
-            f"𝐀𝐦𝐨𝐮𝐧𝐭: {reward} {config.CURRENCY_SYMBOL}\n\n"
-            f"🎯 𝐃𝐚𝐫𝐭𝐬 𝐥𝐞𝐟𝐭 𝐭𝐨𝐝𝐚𝐲: {remaining}\n"
-            f"💰 𝐁𝐚𝐥𝐚𝐧𝐜𝐞: {balance} {config.CURRENCY_SYMBOL}"
+async def _reveal_dart_result(bot, chat_id: int, reply_to_message_id: int, user, dice_value: int, remaining: int):
+    try:
+        await asyncio.sleep(4)  # let the throw animation play out before revealing the result
+
+        reward = dart_reward(dice_value)
+        name_link = _mention(user.id, user.first_name)
+
+        if reward > 0:
+            balance = db.add_currency(user.id, reward)
+            text = (
+                f"{name_link}\n\n"
+                f"🎉 𝐘𝐨𝐮 𝐰𝐨𝐧!\n"
+                f"𝐀𝐦𝐨𝐮𝐧𝐭: {reward} {config.CURRENCY_SYMBOL}\n\n"
+                f"🎯 𝐃𝐚𝐫𝐭𝐬 𝐥𝐞𝐟𝐭 𝐭𝐨𝐝𝐚𝐲: {remaining}\n"
+                f"💰 𝐁𝐚𝐥𝐚𝐧𝐜𝐞: {balance} {config.CURRENCY_SYMBOL}"
+            )
+        else:
+            balance = db.get_currency(user.id)
+            text = (
+                f"{name_link}\n\n"
+                f"😔 𝐌𝐢𝐬𝐬𝐞𝐝 𝐭𝐡𝐞 𝐛𝐨𝐚𝐫𝐝!\n\n"
+                f"🎯 𝐃𝐚𝐫𝐭𝐬 𝐥𝐞𝐟𝐭 𝐭𝐨𝐝𝐚𝐲: {remaining}\n"
+                f"💰 𝐁𝐚𝐥𝐚𝐧𝐜𝐞: {balance} {config.CURRENCY_SYMBOL}"
+            )
+
+        await bot.send_message(
+            chat_id=chat_id, text=text, parse_mode=ParseMode.HTML,
+            reply_to_message_id=reply_to_message_id, allow_sending_without_reply=True,
         )
-    else:
-        balance = db.get_currency(user.id)
-        text = (
-            f"{name_link}\n\n"
-            f"😔 𝐌𝐢𝐬𝐬𝐞𝐝 𝐭𝐡𝐞 𝐛𝐨𝐚𝐫𝐝!\n\n"
-            f"🎯 𝐃𝐚𝐫𝐭𝐬 𝐥𝐞𝐟𝐭 𝐭𝐨𝐝𝐚𝐲: {remaining}\n"
-            f"💰 𝐁𝐚𝐥𝐚𝐧𝐜𝐞: {balance} {config.CURRENCY_SYMBOL}"
-        )
-
-    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+    except Exception:
+        logger.exception("Failed to reveal the /dart result for user %s", user.id)
 
 
 INVENTORY_IMAGE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "inventory.jpg")
@@ -973,7 +1028,7 @@ async def inventory_currency_command(update: Update, context: ContextTypes.DEFAU
     lines = [
         f"🎒 {_bold_sans('INVENTORY')} ",
         "",
-        f"       👤 {display_name}",
+        f"       👤 {html.escape(display_name)}",
         f"       🏆 {_bold_sans('Rank')}  {rank_text}",
         "",
         f"       💰 {_bold_sans(f'{balance:,}')} {config.CURRENCY_SYMBOL}",
@@ -1035,7 +1090,7 @@ async def pay_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("ʏᴏᴜ ᴅᴏɴ'ᴛ ʜᴀᴠᴇ ᴇɴᴏᴜɢʜ VɎ")
         return
 
-    recipient_name = f'<a href="tg://user?id={recipient.id}">{recipient.first_name}</a>'
+    recipient_name = _mention(recipient.id, recipient.first_name)
 
     text = (
         "‌-------------💎ᴛʀᴀɴꜱꜰᴇʀ ᴄᴏᴍᴘʟᴇᴛᴇᴅ💎-------------\n\n"
@@ -1167,7 +1222,7 @@ async def give_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     is_currency = len(context.args) > 1 and context.args[1].lower() == "vy"
-    recipient_name = f'<a href="tg://user?id={recipient.id}">{recipient.first_name}</a>'
+    recipient_name = _mention(recipient.id, recipient.first_name)
 
     if is_currency:
         new_balance = db.add_currency(recipient.id, value)
@@ -1323,7 +1378,7 @@ async def player_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["player_target_id"] = target_id
         display_name = db.get_display_name(target_id)
         await update.message.reply_text(
-            f"👤 Managing <b>{display_name}</b> (<code>{target_id}</code>). What would you like to do?",
+            f"👤 Managing <b>{html.escape(display_name)}</b> (<code>{target_id}</code>). What would you like to do?",
             parse_mode=ParseMode.HTML,
             reply_markup=_player_menu_keyboard(),
         )
@@ -1397,7 +1452,7 @@ async def capture_player_input(update: Update, context: ContextTypes.DEFAULT_TYP
         context.user_data["player_target_id"] = target_id
         display_name = db.get_display_name(target_id)
         await update.message.reply_text(
-            f"👤 Managing <b>{display_name}</b> (<code>{target_id}</code>). What would you like to do?",
+            f"👤 Managing <b>{html.escape(display_name)}</b> (<code>{target_id}</code>). What would you like to do?",
             parse_mode=ParseMode.HTML,
             reply_markup=_player_menu_keyboard(),
         )
@@ -1466,13 +1521,13 @@ async def capture_player_input(update: Update, context: ContextTypes.DEFAULT_TYP
     if is_character_action:
         await send_character_result(context, update.effective_chat.id, character, result_text)
         await update.message.reply_text(
-            f"👤 Still managing <b>{display_name}</b>. What next?",
+            f"👤 Still managing <b>{html.escape(display_name)}</b>. What next?",
             parse_mode=ParseMode.HTML,
             reply_markup=_player_menu_keyboard(),
         )
     else:
         await update.message.reply_text(
-            f"{result_text}\n\n👤 Still managing <b>{display_name}</b>. What next?",
+            f"{result_text}\n\n👤 Still managing <b>{html.escape(display_name)}</b>. What next?",
             parse_mode=ParseMode.HTML,
             reply_markup=_player_menu_keyboard(),
         )
@@ -1579,7 +1634,11 @@ async def _block_banned_users(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     message = update.effective_message
-    if message is not None:
+    is_command = bool(message and (message.text or message.caption or "").startswith("/"))
+    is_private = update.effective_chat is not None and update.effective_chat.type == "private"
+    if message is not None and (is_command or is_private):
+        # Only answer when the banned user actually tried to use the bot; their
+        # ordinary chatter in a group is dropped silently instead of getting a reply each time.
         if ban["banned_until"]:
             until = datetime.fromisoformat(ban["banned_until"]).strftime("%Y-%m-%d %H:%M UTC")
             text = f"🚫 You're banned until {until}."
@@ -1635,7 +1694,7 @@ def _build_artist_stats():
 
 
 def _artist_mention(user_id: int, username: str) -> str:
-    return f'<a href="tg://user?id={user_id}">{format_display_name(user_id, username)}</a>'
+    return _mention(user_id, format_display_name(user_id, username))
 
 
 async def artist_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1787,7 +1846,7 @@ async def set_premium_command(update: Update, context: ContextTypes.DEFAULT_TYPE
             return
 
     db.set_premium(recipient.id, days)
-    recipient_name = f'<a href="tg://user?id={recipient.id}">{recipient.first_name}</a>'
+    recipient_name = _mention(recipient.id, recipient.first_name)
     duration_text = f"for {days} day{'s' if days != 1 else ''}" if days else "permanently"
     await update.message.reply_text(
         f"⭐️ {recipient_name} is now premium ({duration_text}).", parse_mode=ParseMode.HTML
@@ -1809,7 +1868,7 @@ async def remove_premium_command(update: Update, context: ContextTypes.DEFAULT_T
 
     recipient = update.message.reply_to_message.from_user
     db.remove_premium(recipient.id)
-    recipient_name = f'<a href="tg://user?id={recipient.id}">{recipient.first_name}</a>'
+    recipient_name = _mention(recipient.id, recipient.first_name)
     await update.message.reply_text(f"◽ {recipient_name} is no longer premium.", parse_mode=ParseMode.HTML)
 
 
@@ -1913,6 +1972,10 @@ async def trade_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if action == "cancel":
         await query.answer()
         await query.edit_message_text("❌ Trade cancelled.")
+        return
+
+    if not await _consume_buttons(query):  # already handled (double tap)
+        await query.answer()
         return
 
     if not db.is_premium(trader_id):
@@ -2127,6 +2190,10 @@ async def sellbot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("❌ Sale cancelled.")
         return
 
+    if not await _consume_buttons(query):  # already handled (double tap)
+        await query.answer()
+        return
+
     char_id = int(parts[3])
     character = db.get_character(char_id)
     if not character:
@@ -2300,6 +2367,10 @@ async def gift_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("😅 You can't gift a card to yourself!")
         return
 
+    if recipient.is_bot:
+        await update.message.reply_text("🤖 Bots can't collect cards - gift it to a real player!")
+        return
+
     if not db.user_owns_character(giver.id, char_id):
         await update.message.reply_text("❓ You don't own that card.")
         return
@@ -2309,7 +2380,7 @@ async def gift_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❓ No character found with ID #{char_id}.")
         return
 
-    recipient_name = f'<a href="tg://user?id={recipient.id}">{recipient.first_name}</a>'
+    recipient_name = _mention(recipient.id, recipient.first_name)
     keyboard = InlineKeyboardMarkup([[
         InlineKeyboardButton("✅ Confirm", callback_data=f"gift:confirm:{giver.id}:{recipient.id}:{char_id}"),
         InlineKeyboardButton("❌ Cancel", callback_data=f"gift:cancel:{giver.id}"),
@@ -2335,13 +2406,17 @@ async def gift_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("❌ Gift cancelled.")
         return
 
+    if not await _consume_buttons(query):  # already handled (double tap)
+        await query.answer()
+        return
+
     recipient_id = int(parts[3])
     char_id = int(parts[4])
 
     try:
         recipient_chat = await context.bot.get_chat(recipient_id)
         recipient_username = recipient_chat.username or recipient_chat.first_name
-        recipient_name = f'<a href="tg://user?id={recipient_id}">{recipient_chat.first_name}</a>'
+        recipient_name = _mention(recipient_id, recipient_chat.first_name)
     except Exception:
         recipient_username = None
         recipient_name = "them"
@@ -2424,7 +2499,7 @@ async def sort_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await query.edit_message_text("❓ No rarities have been created yet.")
             return
         keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton(r["name"], callback_data=f"sortval:rarity:{r['name']}")]
+            [InlineKeyboardButton(r["name"], callback_data=f"sortval:rarity:{r['id']}")]
             for r in rarities
         ])
         await query.edit_message_text("💎 Pick a rarity to sort by:", reply_markup=keyboard)
@@ -2441,6 +2516,13 @@ async def sort_value_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     await query.answer()
 
     _, filter_type, value = query.data.split(":", 2)
+    if filter_type == "rarity" and value.isdigit():
+        # Buttons carry the rarity id (callback_data is capped at 64 bytes, names can be long/fancy).
+        rarity = db.get_rarity_by_id(int(value))
+        if not rarity:
+            await query.edit_message_text("❓ That rarity no longer exists.")
+            return
+        value = rarity["name"]
     db.set_user_filter(query.from_user.id, filter_type, value)
     await query.edit_message_text(f"✅ Your constellation is now sorted by {filter_type}: {value}")
 
@@ -2746,7 +2828,7 @@ async def _finalize_add_flow(pending_id: str, context: ContextTypes.DEFAULT_TYPE
             "fighter_defense": fighter_defense,
         }
 
-        sender_name = f'<a href="tg://user?id={pending["user_id"]}">{pending["first_name"]}</a>'
+        sender_name = _mention(pending["user_id"], pending["first_name"])
         summary = f"{name} | {series}"
         if rarity_name:
             summary += f" | {rarity_name}"
@@ -3120,12 +3202,12 @@ def build_channel_announcement(character, updated: bool = False, editor_id: int 
         # added the card - /check and build_card_caption still show the
         # original adder, only this channel repost credits the editor.
         if editor_id:
-            artist_display = f'<a href="tg://user?id={editor_id}">{format_display_name(editor_id, editor_username or "Unknown")}</a>'
+            artist_display = _mention(editor_id, format_display_name(editor_id, editor_username or "Unknown"))
         else:
             artist_display = editor_username or "Unknown"
     elif character["added_by_user_id"]:
         artist_name = character["added_by_username"] or "Unknown"
-        artist_display = f'<a href="tg://user?id={character["added_by_user_id"]}">{format_display_name(character["added_by_user_id"], artist_name)}</a>'
+        artist_display = _mention(character["added_by_user_id"], format_display_name(character["added_by_user_id"], artist_name))
     else:
         artist_display = "Unknown"
 
@@ -3211,7 +3293,7 @@ def build_card_caption(character, owners_count: int) -> str:
 
     if character["added_by_user_id"]:
         artist_name = character["added_by_username"] or "Unknown"
-        artist_display = f'<a href="tg://user?id={character["added_by_user_id"]}">{format_display_name(character["added_by_user_id"], artist_name)}</a>'
+        artist_display = _mention(character["added_by_user_id"], format_display_name(character["added_by_user_id"], artist_name))
     else:
         artist_display = "Unknown"
 
@@ -3426,13 +3508,16 @@ async def handle_file_restore_upload(update: Update, context: ContextTypes.DEFAU
 
     volume_dir = _volume_dir()
     os.makedirs(volume_dir, exist_ok=True)
-    download_path = os.path.join("/tmp", document.file_name or "restore.tar.gz")
+    download_path = os.path.join("/tmp", os.path.basename(document.file_name or "restore.tar.gz"))
 
     try:
         tg_file = await context.bot.get_file(document.file_id)
         await tg_file.download_to_drive(download_path)
         with tarfile.open(download_path, "r:*") as tar:
-            tar.extractall(volume_dir)
+            if hasattr(tarfile, "data_filter"):
+                tar.extractall(volume_dir, filter="data")  # refuses ../ paths, absolute paths, special files
+            else:
+                tar.extractall(volume_dir)
         await update.message.reply_text(
             "✅ Volume restored. Everything from the backup is in place now - "
             "restart/redeploy the bot to be safe."
@@ -3504,25 +3589,6 @@ def _new_action_keyboard(flow_id: str):
 def _new_preview_text(flow):
     extra = "\n\nAdded buttons: " + ", ".join(html.escape(b["label"]) for b in flow["buttons"]) if flow["buttons"] else ""
     return f"📩 <b>Message received</b>\n\n{html.escape(flow['fa_text'] or '')}" + extra
-
-
-async def _translate_new_text(text: str, target_language: str) -> str:
-    system = (
-        "You are a precise Telegram message translator. Translate the user's message "
-        f"into {target_language}. Preserve emojis, line breaks, punctuation, mentions, "
-        "URLs and simple formatting exactly where possible. Return ONLY the translated "
-        "message, with no explanation or quotation marks."
-    )
-    try:
-        result = await NEW_AI_CLIENT.complete_chat([
-            {"role": "system", "content": system},
-            {"role": "user", "content": text},
-        ])
-        result = (result or "").strip()
-        return result or text
-    except AIClientError:
-        logger.exception("/new translation failed")
-        return text
 
 
 async def _new_flow_id_for_user(user_id: int):
@@ -4850,297 +4916,174 @@ async def invite_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------------- /help ----------------
+# Every command lives in exactly one entry below: (header, description).
+# build_help_text() stitches together the entries each role is allowed to see.
+# Adding a command? Add it here (and to the right role list) - nothing else.
+
+def _cmd(*variants: str) -> str:
+    return " or ".join(f"<b>{v}</b>" for v in variants)
+
+
+_HELP_PLAYER = [
+    (_cmd("/start"), "Basic intro message."),
+    (_cmd("/help"), "Show this list."),
+    (_cmd("/get [Name]"),
+     "Claim the currently spawned character. Just the first or last name is enough "
+     f"(daily limit: {config.DAILY_CAPTURE_LIMIT}, resets at midnight)."),
+    (_cmd("/constellation"),
+     "See your own collection, grouped by series, with a button to browse all your character photos."),
+    (_cmd("/fav [ID]"), "Pick your favorite card - it becomes the picture shown on your /constellation."),
+    (_cmd("/sort"), "Filter what your constellation shows: by character, series, or rarity."),
+    (_cmd("/miniapp"), "Open the Waifu Market Mini App."),
+    (_cmd("/check [ID]"), "See a character's photo, full details, who added it, and how many players own it."),
+    (_cmd("/rarities"), "List all rarity tiers and how many of each you own."),
+    (_cmd("/prices"),
+     "See the current price range for every rarity, with a button showing how much each event tier adds."),
+    (_cmd("/memories"), "See a timeline of your milestones - first cards, rarity counts, and monthly gifts."),
+    (_cmd("/top"), "Leaderboards: the richest players (/top vy) and the biggest collections (/top collection)."),
+    (_cmd("/premium"), "Check your premium status and perks."),
+    (_cmd("/trade [ID]"), "Premium only - trade a card in for a random other character of the same rarity."),
+    (_cmd("/search [term]"), "Find characters by name, series, or rarity - shows results as a photo gallery."),
+    (_cmd("/gallery"), "Browse every character in the database as a photo gallery."),
+    (_cmd("/gift [ID]"),
+     "Reply to someone with this to give them one of your cards (asks for confirmation first)."),
+    (_cmd("/spawnstatus"), "See which rarities and events are currently locked from spawning."),
+    (_cmd("/dart"), f"Throw a dart for a chance to win currency (up to {config.DAILY_DART_LIMIT} throws/day)."),
+    (_cmd("/inv"), "Check your currency balance."),
+    (_cmd("/vypay [amount]"), "Reply to someone with this to send them some of your currency."),
+    (_cmd("/invite"),
+     "Get your personal invite link - earn currency (and eventually a bonus + a 🌙Nocturne card) "
+     "for every friend who joins through it."),
+    (_cmd("/birthday"),
+     f"Tell the bot today's your birthday: you get a random {config.BIRTHDAY_GIFT_RARITY_NAME} card right away "
+     "and the same gift again every year on this day (can only be set once)."),
+    (_cmd("/sell [ID] [price]"), "List one of your cards on the Waifu Market Mini App for other players to buy."),
+    (_cmd("/cancelsell [listing ID]"), "Pull one of your own active market listings back."),
+    (_cmd("/sellbot [ID]"), "Sell one of your cards straight to the bot for currency (amount depends on rarity)."),
+    (_cmd("/market"), "Browse everyone's active Waifu Market listings."),
+    (_cmd("/send"), "Submit a character (photo + caption, like /addcharacter) for the owner to review and add."),
+]
+
+_ADD_CHARACTER = (
+    _cmd("/addcharacter"),
+    "Send a photo with caption: <code>Name | Series | Rarity(optional) | Event(optional)</code>",
+)
+_EDIT_CHARACTER = (
+    _cmd("/editcharacter ID | Name | Series | Rarity | Event"),
+    "Edit an existing character's details (no photo needed).",
+)
+_ADD_RARITY = (
+    _cmd("/addrarity [name] [weight]"),
+    "Create or update a rarity tier. Higher weight = spawns more often.",
+)
+_EDIT_RARITY = (
+    _cmd("/editrarity [name]"),
+    "Change a rarity's weight (bot will ask you to type the new number).",
+)
+
+# Artist, Manager and Marzieh.
+_HELP_CARD_EDITING = [
+    _ADD_CHARACTER,
+    (_cmd("/removecharacter [ID]"), 'Remove a character (can\'t use "all").'),
+    _EDIT_CHARACTER,
+    _ADD_RARITY,
+    (_cmd("/removerarity [name]"), "Remove one rarity tier."),
+    _EDIT_RARITY,
+]
+
+# Owner: same tools, but "all" is allowed.
+_HELP_CARD_EDITING_OWNER = [
+    _ADD_CHARACTER,
+    (_cmd('/removecharacter [ID or "all"]'),
+     "Remove one character, or wipe all of them at once (recoverable from /bin for 30 days)."),
+    _EDIT_CHARACTER,
+    _ADD_RARITY,
+    (_cmd('/removerarity [name or "all"]'),
+     "Remove one rarity tier, or wipe all of them at once (recoverable from /bin for 30 days)."),
+    _EDIT_RARITY,
+]
+
+# Manager, Marzieh and Owner.
+_HELP_MODERATION = [
+    (_cmd("/ban", "/ban [days]", "/ban [user ID] [days]"),
+     "Reply to a player (or give their ID) to ban them - permanent if no days given."),
+    (_cmd("/unban", "/unban [user ID]"), "Reply to a banned player (or give their ID) to lift their ban."),
+    (_cmd("/forcespawn"), "Instantly spawn a random character in the current group."),
+    (_cmd("/lockspawn [rarity or event]"),
+     "Stop a rarity tier or event's cards from spawning. Multiple locks can be active at once."),
+    (_cmd("/unlockspawn [rarity or event]"), "Re-allow a locked rarity or event to spawn again."),
+    (_cmd("/give [ID]", "/give [amount] vy"),
+     'Reply to someone with this to give them a card by ID, or currency (add "vy" after the amount).'),
+    (_cmd("/player"),
+     "Manage a player's account: send their @username, then add/remove a card or give/take currency."),
+    (_cmd("/new"),
+     "Write a post (Persian + English, optional buttons) and publish it to the announcement channel."),
+]
+
+# Marzieh and Owner.
+_HELP_MARZIEH_TOOLS = [
+    (_cmd("/setsellprice [rarity name] [amount]"),
+     "Set how much currency players get for selling a card of that rarity to the bot with /sellbot "
+     '(use "Unranked" for characters with no rarity). No args shows current prices.'),
+    (_cmd("/setpremium", "/setpremium [days]"),
+     "Reply to someone to grant premium - permanent if no days given, or for that many days."),
+    (_cmd("/removepremium"), "Reply to someone to revoke their premium."),
+    (_cmd("/bin"),
+     "Browse characters, rarities, and events deleted in the last 30 days, and restore them "
+     "one by one or all at once."),
+]
+
+# Owner only.
+_HELP_OWNER_ONLY = [
+    (_cmd("/addadmin [artist|manager|marzieh] [ID]"), "Grant a user Artist, Manager, or Marzieh access."),
+    (_cmd("/removeadmin [ID or \"all\"]"),
+     "Revoke a user's admin access, or every secondary admin at once."),
+    (_cmd("/addevent [name]"), "Register a new event name so it can be tagged onto characters."),
+    (_cmd('/removeevent [name or "all"]'),
+     "Unregister an event, or wipe all of them at once (recoverable from /bin for 30 days)."),
+    (_cmd("/stats"), "See how many users and groups the bot has, with buttons to list them."),
+    (_cmd("/artiststats"),
+     "List everyone who has added a card (via /addcharacter or an approved /send), with buttons "
+     "for cards-per-artist and rarities-per-artist breakdowns."),
+    (_cmd("/character"),
+     "Shows the total number of cards in the bot, with buttons to break that down by rarity, "
+     "character, series, or event."),
+    (_cmd("/setpersonality ID | Personality | Age(optional) | Gender(optional)"),
+     "Set the HIDDEN personality that drives this character's replies in the Mini App's "
+     "Chat tab (players never see this text)."),
+    (_cmd("/setforcejoin"),
+     "Run it inside a group to make membership in that group required before anyone can use the bot."),
+    (_cmd("/filedown"), "Download a .tar.gz backup of the whole data volume."),
+    (_cmd("/fileup"), "Restore a /filedown backup onto the volume (overwrites everything currently there)."),
+]
+
+
+def _help_blocks(entries):
+    return [f"{header}\n{description}" for header, description in entries]
+
+
+def _help_section(title: str, *entry_lists) -> list:
+    blocks = [f"— — — <b>{title}</b> — — —"]
+    for entries in entry_lists:
+        blocks += _help_blocks(entries)
+    return blocks
+
 
 def build_help_text(user_id: int) -> str:
-    lines = [
-        "📖 <b>Commands</b>\n",
-        "<b>/get [Name]</b>\n"
-        "Claim the currently spawned character. Just the first or last name is enough "
-        f"(daily limit: {config.DAILY_CAPTURE_LIMIT}, resets at midnight).",
-        "",
-        "<b>/constellation</b>\n"
-        "See your own collection, grouped by series, with a button to browse all your character photos.",
-        "",
-        "<b>/fav [ID]</b>\n"
-        "Pick your favorite card - it becomes the picture shown on your /constellation.",
-        "",
-        "<b>/miniapp</b>\n"
-        "Open the Waifu Market Mini App.",
-        "",
-        "<b>/check [ID]</b>\n"
-        "See a character's photo, full details, who added it, and how many players own it.",
-        "",
-        "<b>/rarities</b>\n"
-        "List all rarity tiers and how many of each you own.",
-        "",
-        "<b>/prices</b>\n"
-        "See the current price range for every rarity, with a button showing how much each event tier adds.",
-        "",
-        "<b>/memories</b>\n"
-        "See a timeline of your milestones - first cards, rarity counts, and monthly gifts.",
-        "",
-        "<b>/premium</b>\n"
-        "Check your premium status and perks.",
-        "",
-        "<b>/trade [ID]</b>\n"
-        "Premium only - trade a card in for a random other character of the same rarity.",
-        "",
-        "<b>/search [term]</b>\n"
-        "Find characters by name, series, or rarity - shows results as a photo gallery.",
-        "",
-        "<b>/sort</b>\n"
-        "Filter what your constellation shows: by character, series, or rarity.",
-        "",
-        "<b>/gift [ID]</b>\n"
-        "Reply to someone with this to give them one of your cards (asks for confirmation first).",
-        "",
-        "<b>/spawnstatus</b>\n"
-        "See which rarities and events are currently locked from spawning.",
-        "",
-        "<b>/dart</b>\n"
-        f"Throw a dart for a chance to win currency (up to {config.DAILY_DART_LIMIT} throws/day).",
-        "",
-        "<b>/inv</b>\n"
-        "Check your currency balance.",
-        "",
-        "<b>/vypay [amount]</b>\n"
-        "Reply to someone with this to send them some of your currency.",
-        "",
-        "<b>/invite</b>\n"
-        "Get your personal invite link - earn currency (and eventually a bonus + a 🌙Nocturne card) "
-        "for every friend who joins through it.",
-        "",
-        "<b>/sell [ID] [price]</b>\n"
-        "List one of your cards on the Waifu Market Mini App for other players to buy.",
-        "",
-        "<b>/cancelsell [listing ID]</b>\n"
-        "Pull one of your own active market listings back.",
-        "",
-        "<b>/sellbot [ID]</b>\n"
-        "Sell one of your cards straight to the bot for currency (amount depends on rarity).",
-        "",
-        "<b>/market</b>\n"
-        "Browse everyone's active Waifu Market listings.",
-        "",
-        "<b>/gallery</b>\n"
-        "Browse every character in the database as a photo gallery.",
-        "",
-        "<b>/send</b>\n"
-        "Submit a character (photo + caption, like /addcharacter) for the owner to review and add.",
-        "",
-        "<b>/start</b>\n"
-        "Basic intro message.",
-    ]
+    blocks = ["📖 <b>Commands</b>"] + _help_blocks(_HELP_PLAYER)
 
     if is_artist(user_id):
-        lines += [
-            "",
-            "— — — <b>Artist</b> — — —",
-            "",
-            "<b>/addcharacter</b>\n"
-            "Send a photo with caption: <code>Name | Series | Rarity(optional) | Event(optional)</code>",
-            "",
-            "<b>/removecharacter [ID]</b>\n"
-            "Remove a character (can't use \"all\").",
-            "",
-            "<b>/editcharacter ID | Name | Series | Rarity | Event</b>\n"
-            "Edit an existing character's details (no photo needed).",
-            "",
-            "<b>/addrarity [name] [weight]</b>\n"
-            "Create or update a rarity tier. Higher weight = spawns more often.",
-            "",
-            "<b>/removerarity [name]</b>\n"
-            "Remove one rarity tier.",
-            "",
-            "<b>/editrarity [name]</b>\n"
-            "Change a rarity's weight (bot will ask you to type the new number).",
-        ]
-
+        blocks += _help_section("Artist", _HELP_CARD_EDITING)
     if is_manager(user_id):
-        lines += [
-            "",
-            "— — — <b>Manager</b> — — —",
-            "",
-            "<b>/ban</b> or <b>/ban [days]</b> or <b>/ban [user ID] [days]</b>\n"
-            "Reply to a player (or give their ID) to ban them - permanent if no days given.",
-            "",
-            "<b>/unban</b> or <b>/unban [user ID]</b>\n"
-            "Reply to a banned player (or give their ID) to lift their ban.",
-            "",
-            "<b>/forcespawn</b>\n"
-            "Instantly spawn a random character in the current group.",
-            "",
-            "<b>/lockspawn [rarity or event]</b>\n"
-            "Stop a rarity tier or event's cards from spawning.",
-            "",
-            "<b>/unlockspawn [rarity or event]</b>\n"
-            "Re-allow a locked rarity or event to spawn again.",
-            "",
-            "<b>/give [ID]</b> or <b>/give [amount] vy</b>\n"
-            "Reply to someone with this to give them a card by ID, or currency (add \"vy\" after the amount).",
-            "",
-            "<b>/player</b>\n"
-            "Manage a player's account: send their @username, then add/remove a card or give/take currency.",
-            "",
-            "<b>/addcharacter</b>\n"
-            "Send a photo with caption: <code>Name | Series | Rarity(optional) | Event(optional)</code>",
-            "",
-            "<b>/removecharacter [ID]</b>\n"
-            "Remove a character (can't use \"all\").",
-            "",
-            "<b>/editcharacter ID | Name | Series | Rarity | Event</b>\n"
-            "Edit an existing character's details (no photo needed).",
-            "",
-            "<b>/addrarity [name] [weight]</b>\n"
-            "Create or update a rarity tier. Higher weight = spawns more often.",
-            "",
-            "<b>/removerarity [name]</b>\n"
-            "Remove one rarity tier.",
-            "",
-            "<b>/editrarity [name]</b>\n"
-            "Change a rarity's weight (bot will ask you to type the new number).",
-        ]
-
+        blocks += _help_section("Manager", _HELP_MODERATION, _HELP_CARD_EDITING)
     if is_marzieh(user_id):
-        lines += [
-            "",
-            "— — — <b>Marzieh</b> — — —",
-            "",
-            "<b>/ban</b> or <b>/ban [days]</b> or <b>/ban [user ID] [days]</b>\n"
-            "Reply to a player (or give their ID) to ban them - permanent if no days given.",
-            "",
-            "<b>/unban</b> or <b>/unban [user ID]</b>\n"
-            "Reply to a banned player (or give their ID) to lift their ban.",
-            "",
-            "<b>/forcespawn</b>\n"
-            "Instantly spawn a random character in the current group.",
-            "",
-            "<b>/lockspawn [rarity or event]</b>\n"
-            "Stop a rarity tier or event's cards from spawning.",
-            "",
-            "<b>/unlockspawn [rarity or event]</b>\n"
-            "Re-allow a locked rarity or event to spawn again.",
-            "",
-            "<b>/give [ID]</b> or <b>/give [amount] vy</b>\n"
-            "Reply to someone with this to give them a card by ID, or currency (add \"vy\" after the amount).",
-            "",
-            "<b>/player</b>\n"
-            "Manage a player's account: send their @username, then add/remove a card or give/take currency.",
-            "",
-            "<b>/addcharacter</b>\n"
-            "Send a photo with caption: <code>Name | Series | Rarity(optional) | Event(optional)</code>",
-            "",
-            "<b>/removecharacter [ID]</b>\n"
-            "Remove a character (can't use \"all\").",
-            "",
-            "<b>/editcharacter ID | Name | Series | Rarity | Event</b>\n"
-            "Edit an existing character's details (no photo needed).",
-            "",
-            "<b>/addrarity [name] [weight]</b>\n"
-            "Create or update a rarity tier. Higher weight = spawns more often.",
-            "",
-            "<b>/removerarity [name]</b>\n"
-            "Remove one rarity tier.",
-            "",
-            "<b>/editrarity [name]</b>\n"
-            "Change a rarity's weight (bot will ask you to type the new number).",
-            "",
-            "<b>/setsellprice [rarity name] [amount]</b>\n"
-            "Set how much currency players get for selling a card of that rarity to the bot with /sellbot "
-            "(use \"Unranked\" for characters with no rarity). No args shows current prices.",
-            "",
-            "<b>/setpremium</b> or <b>/setpremium [days]</b>\n"
-            "Reply to someone to grant premium - permanent if no days given, or for that many days.",
-            "",
-            "<b>/removepremium</b>\n"
-            "Reply to someone to revoke their premium.",
-            "",
-            "<b>/bin</b>\n"
-            "Browse characters, rarities, and events deleted in the last 30 days, and restore them "
-            "one by one or all at once.",
-        ]
-
+        blocks += _help_section("Marzieh", _HELP_MODERATION, _HELP_CARD_EDITING, _HELP_MARZIEH_TOOLS)
     if is_admin(user_id):
-        lines += [
-            "",
-            "— — — <b>Owner only</b> — — —",
-            "",
-            "<b>/addcharacter</b>\n"
-            "Send a photo with caption: <code>Name | Series | Rarity(optional) | Event(optional)</code>",
-            "",
-            "<b>/removecharacter [ID or \"all\"]</b>\n"
-            "Remove one character, or wipe all of them at once (recoverable from /bin for 30 days).",
-            "",
-            "<b>/addrarity [name] [weight]</b>\n"
-            "Create or update a rarity tier. Higher weight = spawns more often.",
-            "",
-            "<b>/removerarity [name or \"all\"]</b>\n"
-            "Remove one rarity tier, or wipe all of them at once (recoverable from /bin for 30 days).",
-            "",
-            "<b>/bin</b>\n"
-            "Browse characters, rarities, and events deleted in the last 30 days, and restore them "
-            "one by one or all at once.",
-            "",
-            "<b>/forcespawn</b>\n"
-            "Instantly spawn a random character in the current group.",
-            "",
-            "<b>/addadmin [artist|manager|marzieh] [ID]</b>\n"
-            "Grant a user Artist, Manager, or Marzieh access.",
-            "",
-            "<b>/removeadmin [ID or \"all\"]</b>\n"
-            "Revoke a user's admin access, or every secondary admin at once.",
-            "",
-            "<b>/lockspawn [rarity or event]</b>\n"
-            "Stop a rarity tier or event's cards from spawning. Multiple locks can be active at once.",
-            "",
-            "<b>/unlockspawn [rarity or event]</b>\n"
-            "Re-allow a locked rarity or event to spawn again.",
-            "",
-            "<b>/addevent [name]</b>\n"
-            "Register a new event name so it can be tagged onto characters.",
-            "",
-            "<b>/removeevent [name or \"all\"]</b>\n"
-            "Unregister an event, or wipe all of them at once (recoverable from /bin for 30 days).",
-            "",
-            "<b>/setsellprice [rarity name] [amount]</b>\n"
-            "Set how much currency players get for selling a card of that rarity to the bot with /sellbot "
-            "(use \"Unranked\" for characters with no rarity). No args shows current prices.",
-            "",
-            "<b>/stats</b>\n"
-            "See how many users and groups the bot has, with buttons to list them.",
-            "",
-            "<b>/give [ID]</b> or <b>/give [amount] vy</b>\n"
-            "Reply to someone with this to give them a card by ID, or currency (add \"vy\" after the amount).",
-            "",
-            "<b>/artiststats</b>\n"
-            "List everyone who has added a card (via /addcharacter or an approved /send), with buttons "
-            "for cards-per-artist and rarities-per-artist breakdowns.",
-            "",
-            "<b>/character</b>\n"
-            "Shows the total number of cards in the bot, with buttons to break that down by rarity, "
-            "character, or series.",
-            "",
-            "<b>/setpremium</b> or <b>/setpremium [days]</b>\n"
-            "Reply to someone to grant premium - permanent if no days given, or for that many days.",
-            "",
-            "<b>/removepremium</b>\n"
-            "Reply to someone to revoke their premium.",
-            "",
-            "<b>/player</b>\n"
-            "Manage a player's account: send their @username, then add/remove a card or give/take currency.",
-            "",
-            "<b>/ban</b> or <b>/ban [days]</b> or <b>/ban [user ID] [days]</b>\n"
-            "Reply to a player (or give their ID) to ban them - permanent if no days given.",
-            "",
-            "<b>/unban</b> or <b>/unban [user ID]</b>\n"
-            "Reply to a banned player (or give their ID) to lift their ban.",
-            "",
-            "<b>/setpersonality ID | Personality | Age(optional) | Gender(optional)</b>\n"
-            "Set the HIDDEN personality that drives this character's replies in the Mini App's "
-            "Chat tab (players never see this text).",
-        ]
+        blocks += _help_section(
+            "Owner only", _HELP_CARD_EDITING_OWNER, _HELP_MODERATION, _HELP_MARZIEH_TOOLS, _HELP_OWNER_ONLY,
+        )
 
-    return "\n".join(lines)
+    return "\n\n".join(blocks)
 
 
 def _chunk_help_text(text: str, limit: int = 3500):
@@ -5227,30 +5170,30 @@ def main():
     threading.Thread(target=memories.run_nightly_engagement_loop, daemon=True).start()
 
     app = ApplicationBuilder().token(config.BOT_TOKEN).build()
+    _install_personal_button_guard()
+    db.prune_personalized_buttons()
 
     # IMPORTANT (python-telegram-bot): inside ONE group only the FIRST matching
     # handler runs - the rest of that group is skipped. A TypeHandler(Update)
-    # matches everything, so each early "gate" handler needs its OWN group or
+    # matches everything, so every early "gate" handler needs its OWN group or
     # the ones registered after it never fire. Groups run in ascending order.
-    #
-    # NOTE: _block_unowned_callbacks / _install_personal_button_guard (a global
-    # "only the person who triggered this message can press its buttons" guard)
-    # are intentionally NOT enabled: it would also lock out buttons that must be
-    # pressed by someone else (e.g. the owner approving a /send submission).
-    # Buttons that must be personal carry the user id in their callback_data and
-    # check it themselves (forcejoin, gift, trade, sellbot, conspage, ...).
-    app.add_handler(TypeHandler(Update, _block_banned_users), group=-5)
+    app.add_handler(TypeHandler(Update, _ignore_edited_messages), group=-8)
+    app.add_handler(TypeHandler(Update, _bind_update_context), group=-7)
+    app.add_handler(TypeHandler(Update, _block_banned_users), group=-6)
 
     # Count eligible group messages before normal group=0 handlers.
-    # Banned users have already been stopped at group=-5.
+    # Banned users have already been stopped at group=-6.
     # on_group_message handles spam/mute before touching the spawn counter.
     app.add_handler(MessageHandler(
         filters.ChatType.GROUPS
         & (filters.TEXT | filters.PHOTO | filters.VIDEO | filters.ANIMATION | filters.Sticker.ALL)
         & ~filters.COMMAND,
         on_group_message,
-    ), group=-4)
+    ), group=-5)
 
+    # Personal buttons: strangers get "belongs to another user" before anything else
+    # (including the force-join prompt) can react to their tap.
+    app.add_handler(TypeHandler(Update, _block_unowned_callbacks), group=-4)
     app.add_handler(TypeHandler(Update, _block_non_members), group=-3)
     app.add_handler(TypeHandler(Update, _capture_user_info), group=-2)
 

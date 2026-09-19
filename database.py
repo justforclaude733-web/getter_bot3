@@ -19,7 +19,10 @@ from config import (
 
 
 def get_connection():
-    conn = sqlite3.connect(DB_PATH)
+    # The bot, the Mini App API and the background loops all share this one
+    # SQLite file from different threads - wait for a busy lock instead of
+    # failing straight away with "database is locked".
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -715,6 +718,16 @@ def set_personalized_button_owner(chat_id: int, message_id: int, owner_user_id: 
     )
     conn.commit()
     conn.close()
+
+def prune_personalized_buttons(max_age_days: int = 30):
+    """Forget button owners of messages older than `max_age_days` - nobody
+    presses buttons that old, and the table would otherwise grow forever."""
+    cutoff = (datetime.utcnow() - timedelta(days=max_age_days)).isoformat()
+    conn = get_connection()
+    conn.execute("DELETE FROM personalized_buttons WHERE created_at < ?", (cutoff,))
+    conn.commit()
+    conn.close()
+
 
 def get_personalized_button_owner(chat_id: int, message_id: int):
     conn = get_connection()
@@ -2453,6 +2466,7 @@ def transfer_currency(sender_id: int, receiver_id: int, amount: int):
     conn = get_connection()
     cur = conn.cursor()
     try:
+        cur.execute("BEGIN IMMEDIATE")  # take the write lock BEFORE reading, so concurrent requests can't interleave
         cur.execute("SELECT balance FROM currency WHERE user_id = ?", (sender_id,))
         row = cur.fetchone()
         sender_balance = row["balance"] if row else 0
@@ -3024,6 +3038,7 @@ def consume_new_post_button(button_id: int):
     conn = get_connection()
     cur = conn.cursor()
     try:
+        cur.execute("BEGIN IMMEDIATE")  # take the write lock BEFORE reading, so concurrent requests can't interleave
         cur.execute("""
             UPDATE new_post_buttons
             SET uses = uses + 1
@@ -3066,6 +3081,7 @@ def claim_new_card_button(button_id: int, user_id: int, username: str):
     conn = get_connection()
     cur = conn.cursor()
     try:
+        cur.execute("BEGIN IMMEDIATE")  # take the write lock BEFORE reading, so concurrent requests can't interleave
         cur.execute("SELECT * FROM new_post_buttons WHERE id = ?", (button_id,))
         button = cur.fetchone()
         if not button or button["action_type"] != "card":
@@ -3128,6 +3144,7 @@ def claim_new_vy_button(button_id: int, user_id: int, amount: int):
     conn = get_connection()
     cur = conn.cursor()
     try:
+        cur.execute("BEGIN IMMEDIATE")  # take the write lock BEFORE reading, so concurrent requests can't interleave
         cur.execute("SELECT action_type FROM new_post_buttons WHERE id = ?", (button_id,))
         button = cur.fetchone()
         if not button or button["action_type"] != "vy":
@@ -3370,6 +3387,7 @@ def gift_character(giver_id: int, recipient_id: int, recipient_username: str, ch
     Arena team, since they no longer own it."""
     conn = get_connection()
     cur = conn.cursor()
+    cur.execute("BEGIN IMMEDIATE")  # take the write lock BEFORE reading, so concurrent requests can't interleave
     cur.execute(
         "SELECT id FROM user_characters WHERE user_id = ? AND character_id = ? LIMIT 1",
         (giver_id, character_id),
@@ -3451,6 +3469,7 @@ def sell_character_to_bot(user_id: int, character_id: int) -> bool:
     """
     conn = get_connection()
     cur = conn.cursor()
+    cur.execute("BEGIN IMMEDIATE")  # take the write lock BEFORE reading, so concurrent requests can't interleave
     cur.execute("""
         SELECT uc.id FROM user_characters uc
         WHERE uc.user_id = ? AND uc.character_id = ?
@@ -3482,6 +3501,7 @@ def create_listing(user_id: int, username: str, character_id: int, price: int):
     conn = get_connection()
     cur = conn.cursor()
     try:
+        cur.execute("BEGIN IMMEDIATE")  # take the write lock BEFORE reading, so concurrent requests can't interleave
         cur.execute("""
             SELECT uc.id FROM user_characters uc
             WHERE uc.user_id = ? AND uc.character_id = ?
@@ -3559,6 +3579,7 @@ def cancel_listing(listing_id: int, user_id: int) -> bool:
     """Only the seller can cancel, and only while it's still active."""
     conn = get_connection()
     cur = conn.cursor()
+    cur.execute("BEGIN IMMEDIATE")  # take the write lock BEFORE reading, so concurrent requests can't interleave
     cur.execute("SELECT seller_id, status FROM market_listings WHERE id = ?", (listing_id,))
     row = cur.fetchone()
     if not row or row["status"] != "active" or row["seller_id"] != user_id:
@@ -3581,6 +3602,7 @@ def buy_listing(listing_id: int, buyer_id: int, buyer_username: str):
     conn = get_connection()
     cur = conn.cursor()
     try:
+        cur.execute("BEGIN IMMEDIATE")  # take the write lock BEFORE reading, so concurrent requests can't interleave
         cur.execute("SELECT * FROM market_listings WHERE id = ?", (listing_id,))
         listing = cur.fetchone()
         if not listing or listing["status"] != "active":
@@ -3876,6 +3898,7 @@ def claim_task(user_id: int, task_id: int, username: str = None):
     conn = get_connection()
     cur = conn.cursor()
     try:
+        cur.execute("BEGIN IMMEDIATE")  # take the write lock BEFORE reading, so concurrent requests can't interleave
         cur.execute("SELECT * FROM task_definitions WHERE id = ?", (task_id,))
         task = cur.fetchone()
         if not task:
@@ -3929,6 +3952,7 @@ def claim_daily_task_bonus(user_id: int):
     conn = get_connection()
     cur = conn.cursor()
     try:
+        cur.execute("BEGIN IMMEDIATE")  # take the write lock BEFORE reading, so concurrent requests can't interleave
         today = datetime.utcnow().date().isoformat()
         cur.execute("SELECT last_claim_date FROM daily_task_claim WHERE user_id = ?", (user_id,))
         row = cur.fetchone()
@@ -4081,6 +4105,7 @@ def upgrade_fighter_card(user_id: int, user_character_id: int, stat: str):
     conn = get_connection()
     cur = conn.cursor()
     try:
+        cur.execute("BEGIN IMMEDIATE")  # take the write lock BEFORE reading, so concurrent requests can't interleave
         cur.execute("""
             SELECT uc.level, uc.current_attack, uc.current_defense, fs.element
             FROM user_characters uc
@@ -4323,6 +4348,7 @@ def start_arena_battle(attacker_id: int, attacker_username: str = None):
     conn = get_connection()
     cur = conn.cursor()
     try:
+        cur.execute("BEGIN IMMEDIATE")  # take the write lock BEFORE reading, so concurrent requests can't interleave
         cur.execute("SELECT 1 FROM arena_battles WHERE attacker_id = ? AND resolved = 0", (attacker_id,))
         if cur.fetchone():
             return {"ok": False, "reason": "battle_in_progress"}
@@ -4434,6 +4460,7 @@ def resolve_arena_battle(battle_id: int):
     conn = get_connection()
     cur = conn.cursor()
     try:
+        cur.execute("BEGIN IMMEDIATE")  # take the write lock BEFORE reading, so concurrent requests can't interleave
         cur.execute("SELECT * FROM arena_battles WHERE id = ?", (battle_id,))
         battle = cur.fetchone()
         if not battle or battle["resolved"]:
