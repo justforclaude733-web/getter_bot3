@@ -769,13 +769,15 @@ def build_constellation_page(owner_id: int, owner_display_name: str, page: int):
     last_series = None
     for series, item in page_entries:
         if series != last_series:
-            lines.append(f"◈ <b>{series}</b>")
+            if last_series is not None:
+                lines.append("──────✧──────")  # between two series
+            lines.append(f"◈ <b>{html.escape(series)}</b>")
             last_series = series
         rarity_char = item["rarity_name"][0] if item["rarity_name"] else "?"
         event_tag = f" [{item['event_name'][0]}]" if item["event_name"] else ""
         count = counts[item["id"]]
         suffix = f" x{count}" if count > 1 else ""
-        lines.append(f"   {rarity_char}{item['id']} {item['name']}{event_tag}{suffix}")
+        lines.append(f"▸   {rarity_char}〔{item['id']}〕 {html.escape(item['name'])}{event_tag}{suffix}")
     lines.append("━━━━━━━━━━━━━━━━━")
 
     text = "\n".join(lines)
@@ -867,8 +869,8 @@ async def constellation_command(update: Update, context: ContextTypes.DEFAULT_TY
 # ---------------- /fav (favorite card) ----------------
 
 async def fav_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Pins one of your cards as your favorite - /constellation then always
-    shows that card's picture instead of a random one."""
+    """/fav [ID] - shows the card and asks OK / Cancel before pinning it as your
+    favorite (/constellation then always shows that card's picture)."""
     if not context.args:
         await update.message.reply_text(
             "⚠️ Usage: <code>/fav [ID]</code>\n"
@@ -894,19 +896,64 @@ async def fav_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❓ No character found with ID #{char_id}.")
         return
 
-    db.set_favorite_card(user.id, char_id)
-
     caption = (
-        f"❤️ <b>{html.escape(character['name'])}</b> (#{char_id}) is now your favorite card.\n"
-        "It will be the picture on your /constellation from now on."
+        f"❤️ Make <b>{html.escape(character['name'])}</b> (#{char_id}) your favorite card?\n"
+        "It will be the picture on your /constellation."
     )
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ OK", callback_data=f"fav:ok:{user.id}:{char_id}"),
+        InlineKeyboardButton("❌ Cancel", callback_data=f"fav:cancel:{user.id}"),
+    ]])
     if character["image_file_id"]:
         await send_character_result(
             context, update.effective_chat.id, character, caption,
-            reply_to_message_id=update.message.message_id,
+            reply_to_message_id=update.message.message_id, reply_markup=keyboard,
         )
     else:
-        await update.message.reply_text(caption, parse_mode=ParseMode.HTML)
+        await update.message.reply_text(caption, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+
+
+async def _edit_text_or_caption(query, text: str):
+    """Rewrites a bot message whether it is a plain text message or a photo/video card
+    (where the words live in the caption). Leaves the message without buttons."""
+    if getattr(query.message, "text", None):
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML)
+    else:
+        await query.edit_message_caption(caption=text, parse_mode=ParseMode.HTML)
+
+
+async def fav_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    parts = query.data.split(":")
+    action, owner_id = parts[1], int(parts[2])
+
+    if query.from_user.id != owner_id:
+        await query.answer("⛔ This button belongs to another user.", show_alert=True)
+        return
+
+    if action == "cancel":
+        await query.answer()
+        await _edit_text_or_caption(query, "❌ Cancelled - your favorite card stays as it was.")
+        return
+
+    if not await _consume_buttons(query):  # already handled (double tap)
+        await query.answer()
+        return
+
+    char_id = int(parts[3])
+    character = db.get_character(char_id)
+    if not character or not db.user_owns_character(owner_id, char_id):
+        await query.answer()
+        await _edit_text_or_caption(query, "❓ You no longer own that card.")
+        return
+
+    db.set_favorite_card(owner_id, char_id)
+    await query.answer("❤️ Saved!")
+    await _edit_text_or_caption(
+        query,
+        f"❤️ <b>{html.escape(character['name'])}</b> (#{char_id}) is now your favorite card.\n"
+        "It will be the picture on your /constellation from now on.",
+    )
 
 
 # ---------------- /miniapp ----------------
@@ -3564,7 +3611,7 @@ async def add_admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "⚠️ Usage: <code>/addadmin [artist|manager|marzieh] [numeric Telegram ID]</code>\n"
             "Artist: /addcharacter, /removecharacter, /editcharacter, /addrarity, /removerarity, /editrarity.\n"
             "Manager: everything Artist can do, plus /ban, /unban, /forcespawn, /lockspawn, "
-            "/unlockspawn, /give, /player.\n"
+            "/unlockspawn, /give, /player, /new, /addevent, /removeevent.\n"
             "Marzieh: everything Manager can do, plus /setsellprice, /setpremium, /removepremium, /bin.",
             parse_mode=ParseMode.HTML,
         )
@@ -3771,7 +3818,7 @@ def _new_action_keyboard(flow_id: str):
 
 def _new_preview_text(flow):
     extra = "\n\nAdded buttons: " + ", ".join(html.escape(b["label"]) for b in flow["buttons"]) if flow["buttons"] else ""
-    return f"📩 <b>Message received</b>\n\n{html.escape(flow['fa_text'] or '')}" + extra
+    return f"📩 <b>Message received</b>\n\n{html.escape(flow['en_text'] or flow['fa_text'] or '')}" + extra
 
 
 async def _new_flow_id_for_user(user_id: int):
@@ -3792,8 +3839,14 @@ def _new_miniapp_button(label: str, url: str = None):
     return InlineKeyboardButton(label, url=url)
 
 
-def _new_post_keyboard(post_id: int, buttons):
-    rows = [[InlineKeyboardButton("🇬🇧 English", callback_data=f"new:lang:{post_id}:en")]]
+def _new_post_keyboard(post_id: int, buttons, showing: str = "en"):
+    """Keyboard of a published post. `showing` is the language of the text currently
+    displayed: English shows a 🌐 Translate button (-> Persian), Persian shows a way back."""
+    if showing == "en":
+        language_button = InlineKeyboardButton("🌐 Translate", callback_data=f"new:lang:{post_id}:fa")
+    else:
+        language_button = InlineKeyboardButton("🇬🇧 English", callback_data=f"new:lang:{post_id}:en")
+    rows = [[language_button]]
     for b in buttons:
         if b["action_type"] == "url":
             rows.append([InlineKeyboardButton(b["label"], url=b["action_data"])])
@@ -3851,7 +3904,7 @@ async def new_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "buttons": [],
             "button_draft": None,
         }
-        await update.message.reply_text("📝 Send the message text.")
+        await update.message.reply_text("📝 Send the Persian version of the message.")
         return
 
     flow_id = uuid.uuid4().hex[:10]
@@ -3893,7 +3946,7 @@ async def _publish_new_flow(flow_id: str, context: ContextTypes.DEFAULT_TYPE, qu
     try:
         sent = await context.bot.send_message(
             chat_id=flow["channel_target"],
-            text=fa_text,
+            text=en_text,  # the post starts in English; the Translate button switches it to Persian
             reply_markup=keyboard,
         )
     except Exception:
@@ -3938,23 +3991,13 @@ async def new_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not post:
                 await query.answer("⚠️ This message was not found.", show_alert=True)
                 return
-            buttons = db.get_new_post_buttons(post_id)
-            rows = [[InlineKeyboardButton(
-                "🇮🇷 Persian" if target == "en" else "🇬🇧 English",
-                callback_data=f"new:lang:{post_id}:{'fa' if target == 'en' else 'en'}",
-            )]]
-            for b in buttons:
-                if b["action_type"] == "url":
-                    rows.append([InlineKeyboardButton(b["label"], url=b["action_data"])])
-                elif b["action_type"] == "miniapp":
-                    button = _new_miniapp_button(b["label"], b.get("action_data"))
-                    if button:
-                        rows.append([button])
-                else:
-                    rows.append([InlineKeyboardButton(b["label"], callback_data=f"new:use:{b['id']}")])
+            keyboard = _new_post_keyboard(post_id, db.get_new_post_buttons(post_id), showing=target)
             text = post["fa_text"] if target == "fa" else post["en_text"]
-            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(rows))
             await query.answer()
+            try:
+                await query.edit_message_text(text, reply_markup=keyboard)
+            except TelegramError:
+                pass  # already showing this language (someone else just tapped it)
             return
 
         try:
@@ -4111,7 +4154,7 @@ async def capture_new_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         flow["channel_target"] = target
         flow["channel_link"] = text
         flow["stage"] = "fa"
-        await update.message.reply_text("📝 Send the message text.")
+        await update.message.reply_text("📝 Send the Persian version of the message.")
     elif stage == "fa":
         if not text:
             await update.message.reply_text("⚠️ The Persian text cannot be empty.")
@@ -4121,7 +4164,10 @@ async def capture_new_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             raise ApplicationHandlerStop
         flow["fa_text"] = text
         flow["stage"] = "en"
-        await update.message.reply_text("🇬🇧 Send the English version of the message.")
+        await update.message.reply_text(
+            "🇬🇧 Send the English version of the message.\n"
+            "The channel post shows this one first - members tap 🌐 Translate for the Persian text."
+        )
     elif stage == "en":
         if not text:
             await update.message.reply_text("⚠️ The English text cannot be empty.")
@@ -4702,7 +4748,7 @@ async def unlock_spawn_command(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def add_event_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    if not is_admin(user.id):
+    if not (is_admin(user.id) or is_manager(user.id) or is_marzieh(user.id)):
         await update.message.reply_text("⛔ You're not allowed to use this command.")
         return
 
@@ -4715,7 +4761,7 @@ async def add_event_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name = " ".join(context.args)
     if db.add_event(name):
         await update.message.reply_text(
-            f"✅ Event <b>{name}</b> registered. Characters can now be tagged with it.",
+            f"✅ Event <b>{html.escape(name)}</b> registered. Characters can now be tagged with it.",
             parse_mode=ParseMode.HTML,
         )
     else:
@@ -4724,7 +4770,7 @@ async def add_event_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def remove_event_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    if not is_admin(user.id):
+    if not (is_admin(user.id) or is_manager(user.id) or is_marzieh(user.id)):
         await update.message.reply_text("⛔ You're not allowed to use this command.")
         return
 
@@ -4749,7 +4795,7 @@ async def remove_event_command(update: Update, context: ContextTypes.DEFAULT_TYP
 
     if db.remove_event(name):
         await update.message.reply_text(
-            f"🗑️ Event <b>{name}</b> removed (in /bin for 30 days). Existing characters keep their tag, "
+            f"🗑️ Event <b>{html.escape(name)}</b> removed (in /bin for 30 days). Existing characters keep their tag, "
             "but it can no longer be assigned to new ones.",
             parse_mode=ParseMode.HTML,
         )
@@ -5161,7 +5207,8 @@ _HELP_PLAYER = [
      f"(daily limit: {config.DAILY_CAPTURE_LIMIT}, resets at midnight Iran time)."),
     (_cmd("/constellation"),
      "See your own collection, grouped by series, with a button to browse all your character photos."),
-    (_cmd("/fav [ID]"), "Pick your favorite card - it becomes the picture shown on your /constellation."),
+    (_cmd("/fav [ID]"),
+     "Pick your favorite card (confirm with OK / Cancel) - it becomes the picture shown on your /constellation."),
     (_cmd("/sort"),
      "Filter what your constellation shows by character, series, rarity and event - stack as many "
      "filters as you like (one word of a name is enough)."),
@@ -5251,7 +5298,21 @@ _HELP_MODERATION = [
     (_cmd("/player"),
      "Manage a player's account: send their @username, then add/remove a card or give/take currency."),
     (_cmd("/new"),
-     "Write a post (Persian + English, optional buttons) and publish it to the announcement channel."),
+     "Write a post (Persian + English, optional buttons) and publish it to the announcement channel - "
+     "it appears in English with a 🌐 Translate button for the Persian text."),
+]
+
+# Manager and Marzieh (the owner has the same two, with "all" - see below).
+_HELP_EVENTS = [
+    (_cmd("/addevent [name]"), "Register a new event name so it can be tagged onto characters."),
+    (_cmd("/removeevent [name]"),
+     "Unregister an event (recoverable from /bin for 30 days). Only the owner can wipe them all at once."),
+]
+
+_HELP_EVENTS_OWNER = [
+    (_cmd("/addevent [name]"), "Register a new event name so it can be tagged onto characters."),
+    (_cmd('/removeevent [name or "all"]'),
+     "Unregister an event, or wipe all of them at once (recoverable from /bin for 30 days)."),
 ]
 
 # Marzieh and Owner.
@@ -5272,9 +5333,6 @@ _HELP_OWNER_ONLY = [
     (_cmd("/addadmin [artist|manager|marzieh] [ID]"), "Grant a user Artist, Manager, or Marzieh access."),
     (_cmd("/removeadmin [ID or \"all\"]"),
      "Revoke a user's admin access, or every secondary admin at once."),
-    (_cmd("/addevent [name]"), "Register a new event name so it can be tagged onto characters."),
-    (_cmd('/removeevent [name or "all"]'),
-     "Unregister an event, or wipe all of them at once (recoverable from /bin for 30 days)."),
     (_cmd("/stats"), "See how many users and groups the bot has, with buttons to list them."),
     (_cmd("/artiststats"),
      "List everyone who has added a card (via /addcharacter or an approved /send), with buttons "
@@ -5309,12 +5367,15 @@ def build_help_text(user_id: int) -> str:
     if is_artist(user_id):
         blocks += _help_section("Artist", _HELP_CARD_EDITING)
     if is_manager(user_id):
-        blocks += _help_section("Manager", _HELP_MODERATION, _HELP_CARD_EDITING)
+        blocks += _help_section("Manager", _HELP_MODERATION, _HELP_EVENTS, _HELP_CARD_EDITING)
     if is_marzieh(user_id):
-        blocks += _help_section("Marzieh", _HELP_MODERATION, _HELP_CARD_EDITING, _HELP_MARZIEH_TOOLS)
+        blocks += _help_section(
+            "Marzieh", _HELP_MODERATION, _HELP_EVENTS, _HELP_CARD_EDITING, _HELP_MARZIEH_TOOLS,
+        )
     if is_admin(user_id):
         blocks += _help_section(
-            "Owner only", _HELP_CARD_EDITING_OWNER, _HELP_MODERATION, _HELP_MARZIEH_TOOLS, _HELP_OWNER_ONLY,
+            "Owner only", _HELP_CARD_EDITING_OWNER, _HELP_MODERATION, _HELP_EVENTS_OWNER,
+            _HELP_MARZIEH_TOOLS, _HELP_OWNER_ONLY,
         )
 
     return "\n\n".join(blocks)
@@ -5498,6 +5559,7 @@ def main():
     app.add_handler(CallbackQueryHandler(bin_callback, pattern=r"^bin:"))
     app.add_handler(CommandHandler("constellation", constellation_command))
     app.add_handler(CommandHandler("fav", fav_command))
+    app.add_handler(CallbackQueryHandler(fav_callback, pattern=r"^fav:(ok|cancel):\d+"))
     app.add_handler(CommandHandler("miniapp", miniapp_command))
     app.add_handler(CommandHandler("dart", dart_command))
     app.add_handler(CommandHandler("inv", inventory_currency_command))
