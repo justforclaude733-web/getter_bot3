@@ -901,26 +901,36 @@ async def fav_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"❤️ Make <b>{html.escape(character['name'])}</b> (#{char_id}) your favorite card?\n"
         "It will be the picture on your /constellation."
     )
+    await _send_confirmation(
+        update, context, character, caption, f"fav:ok:{user.id}:{char_id}", f"fav:cancel:{user.id}"
+    )
+
+
+async def _edit_text_or_caption(query, text: str, reply_markup=None):
+    """Rewrites a bot message whether it is a plain text message or a photo/video card
+    (where the words live in the caption). Without `reply_markup` the buttons go away."""
+    if getattr(query.message, "text", None):
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
+    else:
+        await query.edit_message_caption(caption=text, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
+
+
+async def _send_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE, character, text: str,
+                             ok_data: str, cancel_data: str):
+    """The "are you sure?" step every card/currency action goes through: the card's picture
+    (when there is a card) with the question as its caption and ✅ OK / ❌ Cancel under it.
+    Nothing happens until OK is pressed - by the same person only."""
     keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ OK", callback_data=f"fav:ok:{user.id}:{char_id}"),
-        InlineKeyboardButton("❌ Cancel", callback_data=f"fav:cancel:{user.id}"),
+        InlineKeyboardButton("✅ OK", callback_data=ok_data),
+        InlineKeyboardButton("❌ Cancel", callback_data=cancel_data),
     ]])
-    if character["image_file_id"]:
+    if character and character["image_file_id"]:
         await send_character_result(
-            context, update.effective_chat.id, character, caption,
+            context, update.effective_chat.id, character, text,
             reply_to_message_id=update.message.message_id, reply_markup=keyboard,
         )
     else:
-        await update.message.reply_text(caption, parse_mode=ParseMode.HTML, reply_markup=keyboard)
-
-
-async def _edit_text_or_caption(query, text: str):
-    """Rewrites a bot message whether it is a plain text message or a photo/video card
-    (where the words live in the caption). Leaves the message without buttons."""
-    if getattr(query.message, "text", None):
-        await query.edit_message_text(text, parse_mode=ParseMode.HTML)
-    else:
-        await query.edit_message_caption(caption=text, parse_mode=ParseMode.HTML)
+        await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
 
 
 async def fav_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1165,22 +1175,57 @@ async def pay_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("🤖 You can't pay a bot.")
         return
 
-    remaining = db.transfer_currency(sender.id, recipient.id, amount)
-
-    if remaining is None:
+    if db.get_currency(sender.id) < amount:
         await update.message.reply_text("ʏᴏᴜ ᴅᴏɴ'ᴛ ʜᴀᴠᴇ ᴇɴᴏᴜɢʜ VɎ")
         return
 
-    recipient_name = _mention(recipient.id, recipient.first_name)
+    await _send_confirmation(
+        update, context, None,
+        f"💸 Send <b>{amount} {config.CURRENCY_SYMBOL}</b> to {_mention(recipient.id, recipient.first_name)}?",
+        f"pay:ok:{sender.id}:{recipient.id}:{amount}", f"pay:cancel:{sender.id}",
+    )
 
-    text = (
+
+async def pay_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """OK / Cancel under the /vypay confirmation. Only OK moves any currency."""
+    query = update.callback_query
+    parts = query.data.split(":")
+    action, sender_id = parts[1], int(parts[2])
+
+    if query.from_user.id != sender_id:
+        await query.answer("Only the sender can confirm this.", show_alert=True)
+        return
+
+    if action == "cancel":
+        await query.answer()
+        await _edit_text_or_caption(query, "❌ Payment cancelled.")
+        return
+
+    if not await _consume_buttons(query):  # already handled (double tap)
+        await query.answer()
+        return
+
+    recipient_id, amount = int(parts[3]), int(parts[4])
+    remaining = db.transfer_currency(sender_id, recipient_id, amount)
+    await query.answer()
+
+    if remaining is None:
+        await _edit_text_or_caption(query, "ʏᴏᴜ ᴅᴏɴ'ᴛ ʜᴀᴠᴇ ᴇɴᴏᴜɢʜ VɎ")
+        return
+
+    try:
+        recipient_chat = await context.bot.get_chat(recipient_id)
+        recipient_name = _mention(recipient_id, recipient_chat.first_name)
+    except Exception:
+        recipient_name = _mention(recipient_id, None)
+
+    await _edit_text_or_caption(
+        query,
         "‌-------------💎ᴛʀᴀɴꜱꜰᴇʀ ᴄᴏᴍᴘʟᴇᴛᴇᴅ💎-------------\n\n"
         f"👝ʀᴇᴄᴇɪᴠᴇʀ:{recipient_name}\n"
         f"💲ᴀᴍᴏᴜɴᴛ:{amount} {config.CURRENCY_SYMBOL}\n"
-        f"💰ʟᴇꜰᴛ:{remaining} {config.CURRENCY_SYMBOL}"
+        f"💰ʟᴇꜰᴛ:{remaining} {config.CURRENCY_SYMBOL}",
     )
-
-    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
 
 # ---------------- Owner tools: /stats & /give ----------------
@@ -1305,7 +1350,7 @@ async def stats_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def give_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    if not (is_admin(uid) or is_manager(uid) or is_marzieh(uid)):
+    if not (is_admin(uid) or is_marzieh(uid)):
         await update.message.reply_text("⛔ You're not allowed to use this command.")
         return
 
@@ -1464,7 +1509,7 @@ def _player_menu_keyboard():
 
 async def player_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    if not (is_admin(uid) or is_manager(uid) or is_marzieh(uid)):
+    if not (is_admin(uid) or is_marzieh(uid)):
         await update.message.reply_text("⛔ You're not allowed to use this command.")
         return
 
@@ -1515,7 +1560,7 @@ async def player_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     await query.answer()
 
     uid = query.from_user.id
-    if not (is_admin(uid) or is_manager(uid) or is_marzieh(uid)):
+    if not (is_admin(uid) or is_marzieh(uid)):
         await query.edit_message_text("⛔ You're not allowed to use this.")
         return
 
@@ -1657,7 +1702,7 @@ async def capture_player_input(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def ban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    if not (is_admin(uid) or is_manager(uid) or is_marzieh(uid)):
+    if not (is_admin(uid) or is_marzieh(uid)):
         await update.message.reply_text("⛔ You're not allowed to use this command.")
         return
 
@@ -1713,7 +1758,7 @@ async def ban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def unban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    if not (is_admin(uid) or is_manager(uid) or is_marzieh(uid)):
+    if not (is_admin(uid) or is_marzieh(uid)):
         await update.message.reply_text("⛔ You're not allowed to use this command.")
         return
 
@@ -2068,14 +2113,11 @@ async def trade_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     rarity_display = character["rarity_name"] or "Unranked"
-    keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ Confirm", callback_data=f"trade:confirm:{user.id}:{char_id}"),
-        InlineKeyboardButton("❌ Cancel", callback_data=f"trade:cancel:{user.id}"),
-    ]])
-    await update.message.reply_text(
-        f"🔄 Trade <b>{character['name']}</b> (#{char_id}, {rarity_display}) for a random "
-        f"<b>{rarity_display}</b> character? This can't be undone.",
-        parse_mode=ParseMode.HTML, reply_markup=keyboard,
+    await _send_confirmation(
+        update, context, character,
+        f"🔄 Trade <b>{html.escape(character['name'])}</b> (#{char_id}, {html.escape(rarity_display)}) for a random "
+        f"<b>{html.escape(rarity_display)}</b> character? This can't be undone.",
+        f"trade:confirm:{user.id}:{char_id}", f"trade:cancel:{user.id}",
     )
 
 
@@ -2091,7 +2133,7 @@ async def trade_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if action == "cancel":
         await query.answer()
-        await query.edit_message_text("❌ Trade cancelled.")
+        await _edit_text_or_caption(query, "❌ Trade cancelled.")
         return
 
     if not await _consume_buttons(query):  # already handled (double tap)
@@ -2100,20 +2142,20 @@ async def trade_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not db.is_premium(trader_id):
         await query.answer()
-        await query.edit_message_text("⭐️ Premium is required for /trade.")
+        await _edit_text_or_caption(query, "⭐️ Premium is required for /trade.")
         return
 
     char_id = int(parts[3])
     character = db.get_character(char_id)
     if not character:
         await query.answer()
-        await query.edit_message_text(f"❓ No character found with ID #{char_id}.")
+        await _edit_text_or_caption(query, f"❓ No character found with ID #{char_id}.")
         return
 
     replacement = db.get_random_character_in_rarity_excluding(character["rarity_id"], char_id)
     if not replacement:
         await query.answer()
-        await query.edit_message_text(
+        await _edit_text_or_caption(query, 
             "❓ There's no other character in that rarity to trade for right now."
         )
         return
@@ -2121,7 +2163,7 @@ async def trade_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     success = db.sell_character_to_bot(trader_id, char_id)
     await query.answer()
     if not success:
-        await query.edit_message_text("❓ You no longer own a free copy of that card (maybe it's listed on the market).")
+        await _edit_text_or_caption(query, "❓ You no longer own a free copy of that card (maybe it's listed on the market).")
         return
 
     username = query.from_user.username or query.from_user.first_name
@@ -2175,25 +2217,59 @@ async def sell_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❓ No character found with ID #{char_id}.")
         return
 
-    seller_username = user.username or user.first_name
-    listing_id = db.create_listing(user.id, seller_username, char_id, price)
+    await _send_confirmation(
+        update, context, character,
+        f"🛍 List <b>{html.escape(character['name'])}</b> (#{char_id}) on the Waifu Market "
+        f"for {price} {config.CURRENCY_SYMBOL}?",
+        f"sell:ok:{user.id}:{char_id}:{price}", f"sell:cancel:{user.id}",
+    )
+
+
+async def sell_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """OK / Cancel under the /sell confirmation. Only OK actually creates the listing."""
+    query = update.callback_query
+    parts = query.data.split(":")
+    action, seller_id = parts[1], int(parts[2])
+
+    if query.from_user.id != seller_id:
+        await query.answer("Only the seller can confirm this.", show_alert=True)
+        return
+
+    if action == "cancel":
+        await query.answer()
+        await _edit_text_or_caption(query, "❌ Cancelled - nothing was listed.")
+        return
+
+    if not await _consume_buttons(query):  # already handled (double tap)
+        await query.answer()
+        return
+
+    char_id, price = int(parts[3]), int(parts[4])
+    character = db.get_character(char_id)
+    if not character or not db.user_owns_character(seller_id, char_id):
+        await query.answer()
+        await _edit_text_or_caption(query, "❓ You no longer own that card.")
+        return
+
+    seller = query.from_user
+    listing_id = db.create_listing(seller_id, seller.username or seller.first_name, char_id, price)
+    await query.answer()
 
     if listing_id is None:
-        await update.message.reply_text(
+        await _edit_text_or_caption(
+            query,
             "❓ Every copy of that card you own is already listed. "
             "Use <code>/cancelsell [listing ID]</code> to pull one back first.",
-            parse_mode=ParseMode.HTML,
         )
         return
 
     keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton("❌ Cancel listing", callback_data=f"cancelsell:{listing_id}:{user.id}"),
+        InlineKeyboardButton("❌ Cancel listing", callback_data=f"cancelsell:{listing_id}:{seller_id}"),
     ]])
-    await send_character_result(
-        context, update.effective_chat.id, character,
-        f"🛍 Listed <b>{character['name']}</b> (#{char_id}) for {price} {config.CURRENCY_SYMBOL} "
+    await _edit_text_or_caption(
+        query,
+        f"🛍 Listed <b>{html.escape(character['name'])}</b> (#{char_id}) for {price} {config.CURRENCY_SYMBOL} "
         f"on the Waifu Market.\nListing ID: <code>{listing_id}</code>",
-        reply_to_message_id=update.message.message_id,
         reply_markup=keyboard,
     )
 
@@ -2284,14 +2360,11 @@ async def sellbot_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ Confirm", callback_data=f"sellbot:confirm:{user.id}:{char_id}"),
-        InlineKeyboardButton("❌ Cancel", callback_data=f"sellbot:cancel:{user.id}"),
-    ]])
-    await update.message.reply_text(
-        f"🏪 Sell <b>{character['name']}</b> (#{char_id}, {rarity_display}) to the bot "
+    await _send_confirmation(
+        update, context, character,
+        f"🏪 Sell <b>{html.escape(character['name'])}</b> (#{char_id}, {html.escape(rarity_display)}) to the bot "
         f"for {price} {config.CURRENCY_SYMBOL}?",
-        parse_mode=ParseMode.HTML, reply_markup=keyboard,
+        f"sellbot:confirm:{user.id}:{char_id}", f"sellbot:cancel:{user.id}",
     )
 
 
@@ -2307,7 +2380,7 @@ async def sellbot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if action == "cancel":
         await query.answer()
-        await query.edit_message_text("❌ Sale cancelled.")
+        await _edit_text_or_caption(query, "❌ Sale cancelled.")
         return
 
     if not await _consume_buttons(query):  # already handled (double tap)
@@ -2318,7 +2391,7 @@ async def sellbot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     character = db.get_character(char_id)
     if not character:
         await query.answer()
-        await query.edit_message_text(f"❓ No character found with ID #{char_id}.")
+        await _edit_text_or_caption(query, f"❓ No character found with ID #{char_id}.")
         return
 
     price = db.get_sell_price(character["rarity_id"])
@@ -2326,7 +2399,7 @@ async def sellbot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     if not success:
-        await query.edit_message_text("❓ You no longer own a free copy of that card (maybe it's listed on the market).")
+        await _edit_text_or_caption(query, "❓ You no longer own a free copy of that card (maybe it's listed on the market).")
         return
 
     new_balance = db.add_currency(seller_id, price)
@@ -2501,13 +2574,10 @@ async def gift_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     recipient_name = _mention(recipient.id, recipient.first_name)
-    keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ Confirm", callback_data=f"gift:confirm:{giver.id}:{recipient.id}:{char_id}"),
-        InlineKeyboardButton("❌ Cancel", callback_data=f"gift:cancel:{giver.id}"),
-    ]])
-    await update.message.reply_text(
-        f"🎁 Gift <b>{character['name']}</b> (#{char_id}) to {recipient_name}?",
-        parse_mode=ParseMode.HTML, reply_markup=keyboard,
+    await _send_confirmation(
+        update, context, character,
+        f"🎁 Gift <b>{html.escape(character['name'])}</b> (#{char_id}) to {recipient_name}?",
+        f"gift:confirm:{giver.id}:{recipient.id}:{char_id}", f"gift:cancel:{giver.id}",
     )
 
 
@@ -2523,7 +2593,7 @@ async def gift_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if action == "cancel":
         await query.answer()
-        await query.edit_message_text("❌ Gift cancelled.")
+        await _edit_text_or_caption(query, "❌ Gift cancelled.")
         return
 
     if not await _consume_buttons(query):  # already handled (double tap)
@@ -2558,7 +2628,7 @@ async def gift_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except Exception:
                     logger.exception("Failed to DM milestone message to %s", recipient_id)
     else:
-        await query.edit_message_text("❓ You no longer own that card.")
+        await _edit_text_or_caption(query, "❓ You no longer own that card.")
 
 
 
@@ -3411,6 +3481,9 @@ async def remove_rarity_command(update: Update, context: ContextTypes.DEFAULT_TY
     name = " ".join(context.args)
 
     if name.lower() == "all":
+        if not is_admin(user.id):
+            await update.message.reply_text("⛔ Only the owner can remove all rarities at once.")
+            return
         db.wipe_all_rarities()
         await update.message.reply_text(
             "🗑️ All rarities have been wiped (affected characters are now Unranked).\n"
@@ -3431,7 +3504,7 @@ async def remove_rarity_command(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def force_spawn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    if not (is_admin(user.id) or is_manager(user.id) or is_marzieh(user.id)):
+    if not (is_admin(user.id) or is_marzieh(user.id)):
         await update.message.reply_text("⛔ You're not allowed to use this command.")
         return
 
@@ -3657,9 +3730,9 @@ async def add_admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "⚠️ Usage: <code>/addadmin [artist|manager|marzieh] [numeric Telegram ID]</code>\n"
             "Artist: /addcharacter, /removecharacter, /editcharacter, /addrarity, /removerarity, /editrarity.\n"
-            "Manager: everything Artist can do, plus /ban, /unban, /forcespawn, /lockspawn, "
-            "/unlockspawn, /give, /player, /new, /addevent, /removeevent.\n"
-            "Marzieh: everything Manager can do, plus /setsellprice, /setpremium, /removepremium, /bin.",
+            "Manager: everything Artist can do, plus /new, /addevent, /removeevent.\n"
+            "Marzieh: everything Manager can do, plus /ban, /unban, /forcespawn, /lockspawn, "
+            "/unlockspawn, /give, /player, /setsellprice, /setpremium, /removepremium, /bin.",
             parse_mode=ParseMode.HTML,
         )
         return
@@ -4735,7 +4808,7 @@ def _canonical_event_name(name: str) -> str:
 
 async def _spawn_lock_command(update: Update, context: ContextTypes.DEFAULT_TYPE, lock: bool):
     user = update.effective_user
-    if not (is_admin(user.id) or is_manager(user.id) or is_marzieh(user.id)):
+    if not (is_admin(user.id) or is_marzieh(user.id)):
         await update.message.reply_text("⛔ You're not allowed to use this command.")
         return
 
@@ -5343,7 +5416,7 @@ _HELP_CARD_EDITING_OWNER = [
     _EDIT_RARITY,
 ]
 
-# Manager, Marzieh and Owner.
+# Marzieh and Owner (managers don't get spawn or player tools).
 _HELP_MODERATION = [
     (_cmd("/ban", "/ban [days]", "/ban [user ID] [days]"),
      "Reply to a player (or give their ID) to ban them - permanent if no days given."),
@@ -5358,6 +5431,10 @@ _HELP_MODERATION = [
      'Reply to someone with this to give them a card by ID, or currency (add "vy" after the amount).'),
     (_cmd("/player"),
      "Manage a player's account: send their @username, then add/remove a card or give/take currency."),
+]
+
+# Manager, Marzieh and Owner.
+_HELP_NEW = [
     (_cmd("/new"),
      "Write a post (Persian + English, optional buttons) and publish it to the announcement channel - "
      "it appears in English with a 🌐 Translate button for the Persian text."),
@@ -5428,14 +5505,14 @@ def build_help_text(user_id: int) -> str:
     if is_artist(user_id):
         blocks += _help_section("Artist", _HELP_CARD_EDITING)
     if is_manager(user_id):
-        blocks += _help_section("Manager", _HELP_MODERATION, _HELP_EVENTS, _HELP_CARD_EDITING)
+        blocks += _help_section("Manager", _HELP_NEW, _HELP_EVENTS, _HELP_CARD_EDITING)
     if is_marzieh(user_id):
         blocks += _help_section(
-            "Marzieh", _HELP_MODERATION, _HELP_EVENTS, _HELP_CARD_EDITING, _HELP_MARZIEH_TOOLS,
+            "Marzieh", _HELP_MODERATION, _HELP_NEW, _HELP_EVENTS, _HELP_CARD_EDITING, _HELP_MARZIEH_TOOLS,
         )
     if is_admin(user_id):
         blocks += _help_section(
-            "Owner only", _HELP_CARD_EDITING_OWNER, _HELP_MODERATION, _HELP_EVENTS_OWNER,
+            "Owner only", _HELP_CARD_EDITING_OWNER, _HELP_MODERATION, _HELP_NEW, _HELP_EVENTS_OWNER,
             _HELP_MARZIEH_TOOLS, _HELP_OWNER_ONLY,
         )
 
@@ -5621,6 +5698,8 @@ def main():
     app.add_handler(CommandHandler("constellation", constellation_command))
     app.add_handler(CommandHandler("fav", fav_command))
     app.add_handler(CallbackQueryHandler(fav_callback, pattern=r"^fav:(ok|cancel):\d+"))
+    app.add_handler(CallbackQueryHandler(sell_confirm_callback, pattern=r"^sell:(ok|cancel):\d+"))
+    app.add_handler(CallbackQueryHandler(pay_callback, pattern=r"^pay:(ok|cancel):\d+"))
     app.add_handler(CommandHandler("miniapp", miniapp_command))
     app.add_handler(CommandHandler("dart", dart_command))
     app.add_handler(CommandHandler("inv", inventory_currency_command))
