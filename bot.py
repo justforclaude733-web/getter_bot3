@@ -968,23 +968,26 @@ MINIAPP_IMAGE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "a
 _MINIAPP_PHOTO_FILE_ID = None  # cached after the first upload so the PNG isn't re-uploaded every time
 
 
+def _miniapp_direct_link(bot_username: str = None) -> str:
+    """The Mini App's direct t.me link: config.MINI_APP_DIRECT_LINK, else the bot's
+    main Mini App link (https://t.me/<bot>?startapp). "" if neither is known."""
+    link = (getattr(config, "MINI_APP_DIRECT_LINK", "") or "").strip()
+    if link:
+        return link
+    return f"https://t.me/{bot_username}?startapp" if bot_username else ""
+
+
 def _miniapp_launch_button(label: str, chat_type: str, bot_username: str = None):
-    """A button that opens the Mini App, or None if it isn't configured.
-    Telegram only allows web_app buttons in PRIVATE chats. In groups the Mini
-    App has to be opened through its direct link (config.MINI_APP_DIRECT_LINK,
-    e.g. https://t.me/YourBot/app) so it still gets its login data; without
-    one, the button opens the bot's private chat instead."""
+    """A button that opens the Mini App, or None if there is no way to open it.
+    In a PRIVATE chat with config.MINI_APP_URL set this is a real web_app button.
+    Telegram doesn't allow those anywhere else, and they need the web URL, so in every
+    other case the button is the Mini App's direct link - which also hands the Mini
+    App its login data, exactly like the web_app button does."""
     url = (config.MINI_APP_URL or "").strip()
-    if not url:
-        return None
-    if chat_type == "private":
+    if url and chat_type == "private":
         return InlineKeyboardButton(label, web_app=WebAppInfo(url=url))
-    direct_link = (getattr(config, "MINI_APP_DIRECT_LINK", "") or "").strip()
-    if direct_link:
-        return InlineKeyboardButton(label, url=direct_link)
-    if bot_username:
-        return InlineKeyboardButton(label, url=f"https://t.me/{bot_username}")
-    return None
+    direct_link = _miniapp_direct_link(bot_username)
+    return InlineKeyboardButton(label, url=direct_link) if direct_link else None
 
 
 async def miniapp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3833,7 +3836,7 @@ def _new_miniapp_button(label: str, url: str = None):
     For /new channel posts, use the configured HTTPS/direct Mini App URL as a
     normal URL button instead. Telegram supports Direct Mini App links in any
     chat; plain HTTPS app URLs still open the configured web app normally."""
-    url = (url or config.MINI_APP_URL or "").strip()
+    url = (url or _miniapp_direct_link() or config.MINI_APP_URL or "").strip()
     if not url:
         return None
     return InlineKeyboardButton(label, url=url)
@@ -4113,10 +4116,12 @@ async def new_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer()
             await query.message.reply_text("💎 Enter the VɎ amount.")
         elif kind == "miniapp":
-            miniapp_url = (config.MINI_APP_URL or "").strip()
+            miniapp_url = (_miniapp_direct_link() or config.MINI_APP_URL or "").strip()
             parsed = urlparse(miniapp_url) if miniapp_url else None
             if not miniapp_url or not parsed or parsed.scheme not in {"http", "https"} or not parsed.netloc:
-                await query.answer("⚠️ The Mini App URL in config.MINI_APP_URL is invalid.", show_alert=True)
+                await query.answer(
+                    "⚠️ No valid Mini App link is set (MINI_APP_DIRECT_LINK / MINI_APP_URL).", show_alert=True
+                )
                 return
             flow["buttons"].append({**draft, "action_data": miniapp_url, "max_uses": None})
             flow["stage"] = "preview"
