@@ -31,6 +31,7 @@ from telegram import (
     InlineKeyboardMarkup,
     InlineQueryResultCachedPhoto,
     InlineQueryResultCachedVideo,
+    LinkPreviewOptions,
     WebAppInfo,
 )
 from telegram.constants import ParseMode
@@ -1203,6 +1204,38 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+def _group_link(chat):
+    """A link people can use to open this group, or None: t.me/<username> for public
+    groups, otherwise the group's invite link - which Telegram only reveals to the bot
+    when it is an admin of that group."""
+    if getattr(chat, "username", None):
+        return f"https://t.me/{chat.username}"
+    return getattr(chat, "invite_link", None) or None
+
+
+def _chunk_lines(text: str, limit: int = 3800):
+    """Splits `text` into pieces under Telegram's length cap, only ever between entries
+    (cutting inside a line could cut through an HTML tag and make Telegram reject it).
+    An indented line belongs to the entry above it, so a group's link stays under its name."""
+    entries = []
+    for line in text.split("\n"):
+        if line.startswith(" ") and entries:
+            entries[-1] += "\n" + line
+        else:
+            entries.append(line)
+
+    chunks, current = [], ""
+    for entry in entries:
+        if current and len(current) + len(entry) + 1 > limit:
+            chunks.append(current)
+            current = entry
+        else:
+            current = f"{current}\n{entry}" if current else entry
+    if current:
+        chunks.append(current)
+    return chunks
+
+
 async def stats_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if not is_admin(query.from_user.id):
@@ -1222,7 +1255,7 @@ async def stats_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines = []
         for row in rows[:MAX_LISTED]:
             name = f"@{row['username']}" if row["username"] else (row["first_name"] or "—")
-            lines.append(f"• <code>{row['user_id']}</code> — {name}")
+            lines.append(f"• <code>{row['user_id']}</code> — {html.escape(name)}")
         text = f"👤 <b>Users ({len(rows)})</b>\n\n" + "\n".join(lines)
         if len(rows) > MAX_LISTED:
             text += f"\n\n… and {len(rows) - MAX_LISTED} more."
@@ -1248,7 +1281,11 @@ async def stats_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 # No longer reachable (removed, chat deleted, etc.) - drop it.
                 db.remove_chat_state(row["chat_id"])
                 continue
-            lines.append(f"• <code>{row['chat_id']}</code> — {title or '(unknown title)'}")
+            link = _group_link(chat)
+            lines.append(
+                f"• <code>{row['chat_id']}</code> — {html.escape(title or '(unknown title)')}\n"
+                + (f"   🔗 {html.escape(link)}" if link else "   🔒 No link available")
+            )
 
         if not lines:
             await query.message.reply_text("👥 The bot isn't currently active in any group.")
@@ -1258,9 +1295,12 @@ async def stats_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if len(rows) > MAX_LISTED:
             text += f"\n\n… and {len(rows) - MAX_LISTED} more not checked."
 
-    # Defensive chunking in case the list still exceeds Telegram's 4096-char cap.
-    for i in range(0, len(text), 4000):
-        await query.message.reply_text(text[i:i + 4000], parse_mode=ParseMode.HTML)
+    # Split between lines if the list exceeds Telegram's 4096-char cap. Link previews are
+    # off: with many links in one message Telegram would preview only the first one.
+    for chunk in _chunk_lines(text):
+        await query.message.reply_text(
+            chunk, parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True)
+        )
 
 
 async def give_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
