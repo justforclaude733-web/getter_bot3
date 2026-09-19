@@ -959,10 +959,14 @@ async def fav_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------------- /miniapp ----------------
 
 MINIAPP_CARD_TEXT = (
-    "✦ WAIFU MARKET\n"
+    "───────── ✦ ─────────\n"
+    "\n"
+    "    𝗪𝗔𝗜𝗙𝗨 𝗠𝗔𝗥𝗞𝗘𝗧\n"
     "\n"
     "Your collection awaits.\n"
-    "Collect, trade & discover new characters."
+    "Collect, trade & discover new characters.\n"
+    "\n"
+    "───────── ✦ ─────────"
 )
 MINIAPP_IMAGE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "miniapp.png")
 _MINIAPP_PHOTO_FILE_ID = None  # cached after the first upload so the PNG isn't re-uploaded every time
