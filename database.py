@@ -733,6 +733,16 @@ def init_db():
         conn.commit()
 
     # ---------------- Force-join settings ----------------
+    # The group where /send submissions are posted for review (besides the owner's DM).
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS review_group_settings (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            chat_id INTEGER NOT NULL,
+            chat_title TEXT,
+            updated_at TEXT NOT NULL
+        )
+    """)
+
     cur.execute("""
         CREATE TABLE IF NOT EXISTS force_join_settings (
             id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -833,6 +843,35 @@ def set_force_join_settings(chat_id: int, invite_link: str):
         "ON CONFLICT(id) DO UPDATE SET chat_id = excluded.chat_id, invite_link = excluded.invite_link, updated_at = excluded.updated_at",
         (chat_id, invite_link, datetime.utcnow().isoformat()),
     )
+    conn.commit()
+    conn.close()
+
+
+# ---------------- Submission review group ----------------
+
+def get_review_group():
+    """The group /send submissions are also posted to, or None."""
+    conn = get_connection()
+    row = conn.execute("SELECT chat_id, chat_title FROM review_group_settings WHERE id = 1").fetchone()
+    conn.close()
+    return row
+
+
+def set_review_group(chat_id: int, chat_title: str = None):
+    conn = get_connection()
+    conn.execute(
+        "INSERT INTO review_group_settings (id, chat_id, chat_title, updated_at) VALUES (1, ?, ?, ?) "
+        "ON CONFLICT(id) DO UPDATE SET chat_id = excluded.chat_id, chat_title = excluded.chat_title, "
+        "updated_at = excluded.updated_at",
+        (chat_id, chat_title, datetime.utcnow().isoformat()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def clear_review_group():
+    conn = get_connection()
+    conn.execute("DELETE FROM review_group_settings WHERE id = 1")
     conn.commit()
     conn.close()
 

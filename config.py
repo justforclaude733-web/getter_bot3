@@ -216,6 +216,10 @@ EVENT_PRICE_TIERS = [
     },
 ]
 
+# /send submissions: the rarity tiers a Manager may approve (Marzieh and the owner can
+# approve any). Matched by tier name, so emoji / styling in the rarity's name don't matter.
+MANAGER_APPROVABLE_RARITIES = ("Common", "Rare", "Mystic", "Legendary", "Elysian")
+
 # ==================== Player memories & nightly engagement ====================
 # How often (seconds) the nightly job runs. It handles two things each
 # pass: recomputing every player's cached "favorite character" (see

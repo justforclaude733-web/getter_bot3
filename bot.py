@@ -94,11 +94,12 @@ _PERSONAL_BUTTON_GUARD_INSTALLED = False
 # it. Exactly two kinds of buttons are exempt:
 #   * PUBLIC: the buttons of already-published /new posts - meant for everyone.
 #   * SELF-GUARDED: buttons whose own handler already checks the user (the
-#     force-join check carries the user id in its callback_data).
+#     force-join check carries the user id in its callback_data; the /send review
+#     buttons are checked by role - reviewers other than the sender must be able to press them).
 # Everything else is bound to its owner automatically - see
 # _install_personal_button_guard() and _block_unowned_callbacks().
 PUBLIC_CALLBACK_PREFIXES = ("new:lang:", "new:use:")
-SELF_GUARDED_CALLBACK_PREFIXES = ("forcejoin:check:",)
+SELF_GUARDED_CALLBACK_PREFIXES = ("forcejoin:check:", "submit:")
 _EXEMPT_CALLBACK_PREFIXES = PUBLIC_CALLBACK_PREFIXES + SELF_GUARDED_CALLBACK_PREFIXES
 
 
@@ -3160,27 +3161,28 @@ async def _finalize_add_flow(pending_id: str, context: ContextTypes.DEFAULT_TYPE
             "fighter_element": fighter_element,
             "fighter_attack": fighter_attack,
             "fighter_defense": fighter_defense,
+            "messages": [],  # (chat_id, message_id) of every review panel, so all can be closed together
         }
 
         sender_name = _mention(pending["user_id"], pending["first_name"])
-        summary = f"{name} | {series}"
+        summary = f"{html.escape(name)} | {html.escape(series)}"  # user-typed text inside an HTML caption
         if rarity_name:
-            summary += f" | {rarity_name}"
+            summary += f" | {html.escape(rarity_name)}"
         if event_name:
-            summary += f" | {event_name}"
+            summary += f" | {html.escape(event_name)}"
         if fighter_element:
             elem = config.ELEMENTS.get(fighter_element, {})
             summary += f"\n🛡 {elem.get('label', fighter_element)} | ATK {fighter_attack} | DEF {fighter_defense}"
 
-        send_kwargs = dict(
+        delivered = await _deliver_submission(
+            context, submission_id,
+            media_type=media_type, file_id=file_id,
             caption=f"📥 Character submission from {sender_name}:\n\n{summary}",
-            parse_mode=ParseMode.HTML,
-            reply_markup=build_submission_keyboard(submission_id),
         )
-        if media_type == "video":
-            await context.bot.send_video(chat_id=config.ADMIN_ID, video=file_id, **send_kwargs)
-        else:
-            await context.bot.send_photo(chat_id=config.ADMIN_ID, photo=file_id, **send_kwargs)
+        if not delivered:
+            PENDING_SUBMISSIONS.pop(submission_id, None)
+            await respond("⚠️ I couldn't deliver your character for review right now. Please try again later.")
+            return
         await respond("✅ Your character will be added soon.")
 
 
@@ -4384,6 +4386,206 @@ def build_submission_keyboard(submission_id: str) -> InlineKeyboardMarkup:
     ])
 
 
+def _manager_can_approve_rarity(rarity_name) -> bool:
+    """Managers may only approve the cheaper tiers (config.MANAGER_APPROVABLE_RARITIES)."""
+    return bool(rarity_name) and economy.match_price_tier(rarity_name) in config.MANAGER_APPROVABLE_RARITIES
+
+
+_MANAGER_LIMIT_TEXT = (
+    "⛔ Managers can only approve Common, Rare, Mystic, Legendary and Elysian cards. "
+    "Ask Marzieh or the owner to review this one."
+)
+
+
+async def _deliver_submission(context, submission_id: str, media_type: str, file_id: str, caption: str) -> int:
+    """Posts a submission's review panel to the owner's DM and to the review group (if one
+    is set), remembering each message so they can all be closed once the card is handled.
+    Returns how many panels were delivered."""
+    targets = [config.ADMIN_ID]
+    review_group = db.get_review_group()
+    if review_group and review_group["chat_id"] not in targets:
+        targets.append(review_group["chat_id"])
+
+    delivered = 0
+    for chat_id in targets:
+        kwargs = dict(
+            chat_id=chat_id, caption=caption, parse_mode=ParseMode.HTML,
+            reply_markup=build_submission_keyboard(submission_id),
+        )
+        try:
+            if media_type == "video":
+                sent = await context.bot.send_video(video=file_id, **kwargs)
+            else:
+                sent = await context.bot.send_photo(photo=file_id, **kwargs)
+        except Exception:
+            logger.exception("Could not post submission %s to chat %s", submission_id, chat_id)
+            continue
+        PENDING_SUBMISSIONS[submission_id]["messages"].append((chat_id, sent.message_id))
+        delivered += 1
+    return delivered
+
+
+async def set_review_group_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/setreviewgroup (inside a group) - post /send submissions there too.
+    /setreviewgroup off - stop. Owner only."""
+    user = update.effective_user
+    chat = update.effective_chat
+    if not is_admin(user.id):
+        await update.message.reply_text("⛔ Only the owner can use this command.")
+        return
+
+    if context.args and context.args[0].lower() == "off":
+        db.clear_review_group()
+        await update.message.reply_text("✅ Submissions now go to the owner's DM only.")
+        return
+
+    if chat is None or chat.type not in ("group", "supergroup"):
+        await update.message.reply_text(
+            "⚠️ Run /setreviewgroup inside the group where submissions should be reviewed "
+            "(add the bot to it first). Use <code>/setreviewgroup off</code> to stop.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    db.set_review_group(chat.id, chat.title)
+    await update.message.reply_text(
+        "✅ This group is now the submission review group.\n"
+        "New /send submissions appear here and in the owner's DM. Marzieh can approve any of them; "
+        "managers only Common, Rare, Mystic, Legendary and Elysian cards. "
+        "Once one is handled, the panel closes everywhere."
+    )
+
+
+async def submission_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user = query.from_user
+
+    is_owner = is_admin(user.id)
+    can_approve_everything = is_owner or is_marzieh(user.id)
+    if not (can_approve_everything or is_manager(user.id)):
+        await query.answer("⛔ Only the owner, Marzieh and managers can review submissions.", show_alert=True)
+        return
+
+    parts = query.data.split(":")
+    action = parts[1]
+    submission_id = parts[2]
+
+    submission = PENDING_SUBMISSIONS.get(submission_id)
+    if submission is None:
+        await query.answer(
+            "⚠️ This submission is no longer available (already handled, or the bot restarted).",
+            show_alert=True,
+        )
+        return
+
+    # Managers only handle the cheaper tiers - checked here, not just by hiding buttons.
+    if not can_approve_everything and submission["rarity_name"] and not _manager_can_approve_rarity(
+        submission["rarity_name"]
+    ):
+        await query.answer(_MANAGER_LIMIT_TEXT, show_alert=True)
+        return
+
+    # Swap the two buttons for the rarity picker
+    if action == "rarity":
+        rarities = db.list_rarities()
+        if not can_approve_everything:
+            rarities = [r for r in rarities if _manager_can_approve_rarity(r["name"])]
+        if not rarities:
+            await query.answer("❓ No rarities defined yet - use /addrarity first.", show_alert=True)
+            return
+        rows = [
+            [InlineKeyboardButton(r["name"], callback_data=f"submit:setrarity:{submission_id}:{r['id']}")]
+            for r in rarities
+        ]
+        rows.append([InlineKeyboardButton("◀️ Back", callback_data=f"submit:back:{submission_id}")])
+        await query.answer()
+        await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(rows))
+        return
+
+    # Back out of the rarity picker to the original two buttons
+    if action == "back":
+        await query.answer()
+        await query.edit_message_reply_markup(reply_markup=build_submission_keyboard(submission_id))
+        return
+
+    if action == "add":
+        # Use whatever rarity (if any) was already in the /send caption
+        rarity_name = submission["rarity_name"]
+        if not can_approve_everything and not rarity_name:
+            await query.answer("⚠️ This card has no rarity yet - tap 🏷 Choose rarity first.", show_alert=True)
+            return
+    elif action == "setrarity":
+        # Same character, but the reviewer's chosen rarity overrides it
+        rarity_id = int(parts[3])
+        rarity_row = db.get_rarity_by_id(rarity_id)
+        rarity_name = rarity_row["name"] if rarity_row else None
+        if not can_approve_everything and not _manager_can_approve_rarity(rarity_name):
+            await query.answer(_MANAGER_LIMIT_TEXT, show_alert=True)
+            return
+    else:
+        await query.answer()
+        return
+
+    # Claim the submission BEFORE doing anything else: whoever gets here first adds the
+    # card; anyone pressing a button on another copy of the panel finds it gone.
+    submission = PENDING_SUBMISSIONS.pop(submission_id, None)
+    if submission is None:
+        await query.answer("⚠️ This submission was just handled by someone else.", show_alert=True)
+        return
+
+    event_was_dropped = bool(submission["event_name"]) and not db.event_exists(submission["event_name"])
+
+    char_id = db.add_character(
+        submission["name"], submission["series"], submission["file_id"], rarity_name,
+        added_by_user_id=submission["sender_user_id"], added_by_username=submission["sender_username"],
+        event_name=submission["event_name"], media_type=submission.get("media_type") or "photo",
+    )
+    fighter_element = submission.get("fighter_element")
+    if fighter_element and submission.get("fighter_attack") is not None and submission.get("fighter_defense") is not None:
+        db.set_fighter_stats(char_id, fighter_element, submission["fighter_attack"], submission["fighter_defense"])
+
+    character = db.get_character(char_id)
+    caption_text = build_channel_announcement(character)
+    try:
+        sent = await _send_character_media(
+            context.bot, config.ARCHIVE_CHANNEL, character,
+            caption=caption_text, parse_mode=ParseMode.HTML,
+        )
+        db.set_archive_message_id(char_id, sent.message_id)
+    except Exception:
+        logger.exception("Failed to post new character to archive channel")
+
+    await query.answer("✅ Added!")
+    rarity_display = rarity_name if rarity_name else "Unranked"
+    caption = (
+        f"✅ Added <b>{html.escape(submission['name'])}</b> ({html.escape(submission['series'])}) as #{char_id}\n"
+        f"Rarity: {html.escape(rarity_display)}"
+    )
+    if fighter_element:
+        elem = config.ELEMENTS.get(fighter_element, {})
+        caption += (
+            f"\n\n🛡 Fighter\nElement: {elem.get('label', fighter_element)}"
+            f"\nBase Attack: {submission['fighter_attack']}\nBase Defense: {submission['fighter_defense']}"
+        )
+    if event_was_dropped:
+        caption += f"\n⚠️ Event \"{html.escape(submission['event_name'])}\" isn't registered - added without an event."
+    caption += f"\n\n👤 Approved by {_mention(user.id, user.first_name)}"
+
+    # Close the panel everywhere - the one that was pressed and its copies in the other
+    # chats - so this card can't be added a second time.
+    await query.edit_message_caption(caption=caption, parse_mode=ParseMode.HTML)
+    pressed = (query.message.chat.id, query.message.message_id)
+    for chat_id, message_id in submission.get("messages", []):
+        if (chat_id, message_id) == pressed:
+            continue
+        try:
+            await context.bot.edit_message_caption(
+                chat_id=chat_id, message_id=message_id, caption=caption, parse_mode=ParseMode.HTML
+            )
+        except TelegramError:
+            logger.warning("Could not close submission panel %s/%s", chat_id, message_id)
+
+
 async def send_character_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Public command - any player can submit a character for the owner
     # to review and add (banned users are already blocked globally by
@@ -4439,96 +4641,6 @@ async def send_character_command(update: Update, context: ContextTypes.DEFAULT_T
     }
 
     await _advance_add_flow(pending_id, context, message=update.message)
-
-
-async def submission_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    user = query.from_user
-
-    if not is_admin(user.id):
-        await query.answer("⛔ Only the bot owner can review submissions.", show_alert=True)
-        return
-
-    parts = query.data.split(":")
-    action = parts[1]
-    submission_id = parts[2]
-
-    submission = PENDING_SUBMISSIONS.get(submission_id)
-    if submission is None:
-        await query.answer("⚠️ This submission is no longer available (already handled, or the bot restarted).", show_alert=True)
-        return
-
-    # Swap the two buttons for the rarity picker
-    if action == "rarity":
-        rarities = db.list_rarities()
-        if not rarities:
-            await query.answer("❓ No rarities defined yet - use /addrarity first.", show_alert=True)
-            return
-        rows = [
-            [InlineKeyboardButton(r["name"], callback_data=f"submit:setrarity:{submission_id}:{r['id']}")]
-            for r in rarities
-        ]
-        rows.append([InlineKeyboardButton("◀️ Back", callback_data=f"submit:back:{submission_id}")])
-        await query.answer()
-        await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(rows))
-        return
-
-    # Back out of the rarity picker to the original two buttons
-    if action == "back":
-        await query.answer()
-        await query.edit_message_reply_markup(reply_markup=build_submission_keyboard(submission_id))
-        return
-
-    if action == "add":
-        # Use whatever rarity (if any) was already in the /send caption
-        rarity_name = submission["rarity_name"]
-    elif action == "setrarity":
-        # Same character, but the owner's chosen rarity overrides it
-        rarity_id = int(parts[3])
-        rarity_row = db.get_rarity_by_id(rarity_id)
-        rarity_name = rarity_row["name"] if rarity_row else None
-    else:
-        await query.answer()
-        return
-
-    event_was_dropped = bool(submission["event_name"]) and not db.event_exists(submission["event_name"])
-
-    char_id = db.add_character(
-        submission["name"], submission["series"], submission["file_id"], rarity_name,
-        added_by_user_id=submission["sender_user_id"], added_by_username=submission["sender_username"],
-        event_name=submission["event_name"], media_type=submission.get("media_type") or "photo",
-    )
-    fighter_element = submission.get("fighter_element")
-    if fighter_element and submission.get("fighter_attack") is not None and submission.get("fighter_defense") is not None:
-        db.set_fighter_stats(char_id, fighter_element, submission["fighter_attack"], submission["fighter_defense"])
-    del PENDING_SUBMISSIONS[submission_id]
-
-    character = db.get_character(char_id)
-    caption_text = build_channel_announcement(character)
-    try:
-        sent = await _send_character_media(
-            context.bot, config.ARCHIVE_CHANNEL, character,
-            caption=caption_text, parse_mode=ParseMode.HTML,
-        )
-        db.set_archive_message_id(char_id, sent.message_id)
-    except Exception:
-        logger.exception("Failed to post new character to archive channel")
-
-    await query.answer("✅ Added!")
-    rarity_display = rarity_name if rarity_name else "Unranked"
-    caption = (
-        f"✅ Added <b>{submission['name']}</b> ({submission['series']}) as #{char_id}\n"
-        f"Rarity: {rarity_display}"
-    )
-    if fighter_element:
-        elem = config.ELEMENTS.get(fighter_element, {})
-        caption += (
-            f"\n\n🛡 Fighter\nElement: {elem.get('label', fighter_element)}"
-            f"\nBase Attack: {submission['fighter_attack']}\nBase Defense: {submission['fighter_defense']}"
-        )
-    if event_was_dropped:
-        caption += f"\n⚠️ Event \"{submission['event_name']}\" isn't registered - added without an event."
-    await query.edit_message_caption(caption=caption, parse_mode=ParseMode.HTML)
 
 
 # ---------------- Admin: /editrarity & /editcharacter (Artist/Manager/Marzieh) ----------------
@@ -5374,7 +5486,7 @@ _HELP_PLAYER = [
     (_cmd("/cancelsell [listing ID]"), "Pull one of your own active market listings back."),
     (_cmd("/sellbot [ID]"), "Sell one of your cards straight to the bot for currency (amount depends on rarity)."),
     (_cmd("/market"), "Browse everyone's active Waifu Market listings."),
-    (_cmd("/send"), "Submit a character (photo + caption, like /addcharacter) for the owner to review and add."),
+    (_cmd("/send"), "Submit a character (photo + caption, like /addcharacter) for the team to review and add."),
 ]
 
 _ADD_CHARACTER = (
@@ -5483,6 +5595,9 @@ _HELP_OWNER_ONLY = [
      "Chat tab (players never see this text)."),
     (_cmd("/setforcejoin"),
      "Run it inside a group to make membership in that group required before anyone can use the bot."),
+    (_cmd("/setreviewgroup", "/setreviewgroup off"),
+     "Run it inside a group to also post /send submissions there for review (Marzieh approves any, "
+     "managers only Common-Elysian); with off they go to your DM only."),
     (_cmd("/filedown"), "Download a .tar.gz backup of the whole data volume."),
     (_cmd("/fileup"), "Restore a /filedown backup onto the volume (overwrites everything currently there)."),
 ]
@@ -5631,6 +5746,7 @@ def main():
     app.add_handler(TypeHandler(Update, _capture_user_info), group=-2)
 
     app.add_handler(CommandHandler("setforcejoin", set_force_join_command), group=0)
+    app.add_handler(CommandHandler("setreviewgroup", set_review_group_command), group=0)
     app.add_handler(CallbackQueryHandler(force_join_check_callback, pattern=r"^forcejoin:check:\d+$"), group=0)
 
     app.add_handler(CommandHandler("start", start_command))
