@@ -229,15 +229,15 @@ def is_admin(user_id: int) -> bool:
 
 
 def is_artist(user_id: int) -> bool:
-    return db.get_admin_type(user_id) == "ARTIST"
+    return db.has_permission(user_id, "ARTIST")
 
 
 def is_manager(user_id: int) -> bool:
-    return db.get_admin_type(user_id) == "MANAGER"
+    return db.has_permission(user_id, "MANAGER")
 
 
 def is_marzieh(user_id: int) -> bool:
-    return db.get_admin_type(user_id) == "MARZIEH"
+    return db.has_permission(user_id, "MARZIEH")
 
 
 def _volume_dir() -> str:
@@ -3790,6 +3790,193 @@ async def remove_admin_command(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text(f"❓ User <code>{target_id}</code> wasn't an admin.", parse_mode=ParseMode.HTML)
 
 
+# ---------------- Admin: /admin (give/take individual permissions with buttons) ----------------
+# A friendlier alternative to /addadmin & /removeadmin above: pick an admin
+# from a list, then tap permissions on and off one at a time instead of
+# retyping a command. Both older commands keep working exactly as before -
+# this is just another door into the same admin_permissions table.
+
+def _format_permissions(perm_keys) -> str:
+    """"🖌 Artist, 🛡 Marzieh" style summary for a set of permission keys."""
+    if not perm_keys:
+        return "—"
+    by_key = {p["key"]: p["label"] for p in config.ADMIN_PERMISSIONS}
+    return ", ".join(by_key.get(key, key) for key in perm_keys)
+
+
+def _admin_mention(user_id: int) -> str:
+    return _mention(user_id, format_display_name(user_id, db.get_display_name(user_id)))
+
+
+def _admin_list_keyboard():
+    rows = [
+        [InlineKeyboardButton(
+            f"{db.get_display_name(uid)} — {_format_permissions(db.get_permissions(uid))}",
+            callback_data=f"adminperm:select:{uid}",
+        )]
+        for uid in db.get_all_admins()
+    ]
+    rows.append([InlineKeyboardButton("➕ Add new admin", callback_data="adminperm:newadmin")])
+    rows.append([InlineKeyboardButton("✅ Done", callback_data="adminperm:done")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _admin_list_text() -> str:
+    admins = db.get_all_admins()
+    if not admins:
+        return "👥 <b>Admins</b>\n\nNo secondary admins yet - add one to get started."
+    return f"👥 <b>Admins ({len(admins)})</b>\n\nSelect one to edit their access:"
+
+
+def _admin_menu_keyboard(user_id: int):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Give access", callback_data=f"adminperm:give:{user_id}")],
+        [InlineKeyboardButton("➖ Take access", callback_data=f"adminperm:take:{user_id}")],
+        [InlineKeyboardButton("🔙 Back to list", callback_data="adminperm:list")],
+    ])
+
+
+def _admin_menu_text(user_id: int) -> str:
+    perms = _format_permissions(db.get_permissions(user_id))
+    return f"👤 {_admin_mention(user_id)} (<code>{user_id}</code>)\nCurrent access: {perms}"
+
+
+def _permission_toggle_keyboard(user_id: int, action: str):
+    """action is "give" (permissions this admin doesn't have yet) or "take" (ones they do)."""
+    held = set(db.get_permissions(user_id))
+    rows = []
+    for perm in config.ADMIN_PERMISSIONS:
+        has_it = perm["key"] in held
+        if action == "give" and not has_it:
+            rows.append([InlineKeyboardButton(
+                perm["label"], callback_data=f"adminperm:grant:{user_id}:{perm['key']}"
+            )])
+        elif action == "take" and has_it:
+            rows.append([InlineKeyboardButton(
+                perm["label"], callback_data=f"adminperm:revoke:{user_id}:{perm['key']}"
+            )])
+    rows.append([InlineKeyboardButton("🔙 Back", callback_data=f"adminperm:select:{user_id}")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _permission_list_view(user_id: int, action: str):
+    """(text, keyboard) for the give/take permission list."""
+    heading = "➕ <b>Give access</b>" if action == "give" else "➖ <b>Take access</b>"
+    keyboard = _permission_toggle_keyboard(user_id, action)
+    mention = _admin_mention(user_id)
+    if len(keyboard.inline_keyboard) == 1:  # only the Back button - nothing left to toggle
+        note = "already has every permission." if action == "give" else "has no permissions to take yet."
+        text = f"{heading}\n\n{mention} {note}"
+    else:
+        verb = "doesn't have yet" if action == "give" else "currently has"
+        text = f"{heading}\n\nPermissions {mention} {verb}:"
+    return text, keyboard
+
+
+async def admin_panel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not is_admin(user.id):
+        await update.message.reply_text("⛔ You're not allowed to use this command.")
+        return
+
+    await update.message.reply_text(_admin_list_text(), parse_mode=ParseMode.HTML, reply_markup=_admin_list_keyboard())
+
+
+async def admin_panel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not is_admin(query.from_user.id):
+        await query.answer("⛔ Only the bot owner can view this.", show_alert=True)
+        return
+
+    parts = query.data.split(":")
+    action = parts[1]
+
+    if action == "done":
+        await query.answer()
+        context.user_data.pop("adminperm_awaiting_new_id", None)
+        await query.edit_message_text("✅ Closed the admin panel.")
+        return
+
+    if action == "list":
+        await query.answer()
+        context.user_data.pop("adminperm_awaiting_new_id", None)
+        await query.edit_message_text(_admin_list_text(), parse_mode=ParseMode.HTML, reply_markup=_admin_list_keyboard())
+        return
+
+    if action == "newadmin":
+        await query.answer()
+        context.user_data["adminperm_awaiting_new_id"] = True
+        await query.edit_message_text("✏️ Send the new admin's numeric Telegram ID or @username:")
+        return
+
+    if action == "select":
+        await query.answer()
+        target_id = int(parts[2])
+        await query.edit_message_text(
+            _admin_menu_text(target_id), parse_mode=ParseMode.HTML, reply_markup=_admin_menu_keyboard(target_id)
+        )
+        return
+
+    if action in ("give", "take"):
+        await query.answer()
+        text, keyboard = _permission_list_view(int(parts[2]), action)
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+        return
+
+    if action in ("grant", "revoke"):
+        target_id = int(parts[2])
+        permission = parts[3]
+        label = next((p["label"] for p in config.ADMIN_PERMISSIONS if p["key"] == permission), permission)
+
+        if action == "grant":
+            db.grant_permission(target_id, permission)
+            await query.answer(f"✅ {label} access granted.")
+            sub_action = "give"
+        else:
+            db.revoke_permission(target_id, permission)
+            await query.answer(f"✅ {label} access removed.")
+            sub_action = "take"
+
+        # Stay on the same give/take list so several permissions can be
+        # toggled one after another without hopping back and forth.
+        text, keyboard = _permission_list_view(target_id, sub_action)
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+        return
+
+
+async def capture_admin_new_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Its own handler group - only acts when /admin's "Add new admin" prompt is waiting on the owner."""
+    if not context.user_data.get("adminperm_awaiting_new_id"):
+        return
+    if not is_admin(update.effective_user.id):
+        return
+
+    text = (update.message.text or "").strip()
+    if not text:
+        return
+
+    target_id = None
+    if text.lstrip("+").isdigit():
+        try:
+            target_id = int(text)
+        except ValueError:
+            target_id = None
+    else:
+        target_id = db.get_user_id_by_username(text.lstrip("@"))
+
+    if not target_id:
+        await update.message.reply_text(
+            "❓ No user found. Send a valid numeric Telegram ID or @username. "
+            "For usernames, the person needs to have interacted with the bot at least once."
+        )
+        return
+
+    context.user_data.pop("adminperm_awaiting_new_id", None)
+    await update.message.reply_text(
+        _admin_menu_text(target_id), parse_mode=ParseMode.HTML, reply_markup=_admin_menu_keyboard(target_id)
+    )
+
+
 # ---------------- Owner only: /filedown & /fileup (volume backup/restore) ----------------
 # Not listed in /help on purpose - this is a maintenance tool for moving
 # everything on the Railway volume (the DB and anything else living next
@@ -5580,6 +5767,8 @@ _HELP_MARZIEH_TOOLS = [
 
 # Owner only.
 _HELP_OWNER_ONLY = [
+    (_cmd("/admin"),
+     "Browse admins with buttons and give/take Artist, Manager, or Marzieh access one permission at a time."),
     (_cmd("/addadmin [artist|manager|marzieh] [ID]"), "Grant a user Artist, Manager, or Marzieh access."),
     (_cmd("/removeadmin [ID or \"all\"]"),
      "Revoke a user's admin access, or every secondary admin at once."),
@@ -5802,6 +5991,8 @@ def main():
     app.add_handler(CommandHandler("forcespawn", force_spawn_command))
     app.add_handler(CommandHandler("addadmin", add_admin_command))
     app.add_handler(CommandHandler("removeadmin", remove_admin_command))
+    app.add_handler(CommandHandler("admin", admin_panel_command))
+    app.add_handler(CallbackQueryHandler(admin_panel_callback, pattern=r"^adminperm:"))
     app.add_handler(CommandHandler("filedown", file_down_command))
     app.add_handler(CommandHandler("fileup", file_up_command))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_file_restore_upload))
@@ -5859,6 +6050,9 @@ def main():
     # its own group - only acts when the owner has an active /player prompt
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, capture_player_input), group=3)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, capture_edit_character_input), group=4)
+
+    # its own group - only acts when the owner has an active /admin "add new admin" prompt
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, capture_admin_new_id), group=5)
 
     logger.info("Bot starting...")
     KNOWN_COMMANDS.update(

@@ -191,6 +191,30 @@ def init_db():
     except sqlite3.OperationalError:
         pass
 
+    # ---------------- Granular per-admin permissions (Artist/Manager/Marzieh) ----------------
+    # Replaces the single admin_type slot above with a proper set: a secondary
+    # admin can now hold any combination of permissions at once, toggled
+    # independently from /admin's "Give access" / "Take access" buttons
+    # (see grant_permission / revoke_permission further down).
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS admin_permissions (
+            user_id INTEGER NOT NULL,
+            permission TEXT NOT NULL,
+            PRIMARY KEY (user_id, permission)
+        )
+    """)
+
+    # One-time carry-over: anyone who already had a single admin_type keeps
+    # that same access as their first granted permission. Safe to run on
+    # every startup - INSERT OR IGNORE makes it a no-op once migrated.
+    cur.execute("SELECT user_id, admin_type FROM secondary_admins WHERE admin_type IS NOT NULL")
+    for row in cur.fetchall():
+        cur.execute(
+            "INSERT OR IGNORE INTO admin_permissions (user_id, permission) VALUES (?, ?)",
+            (row["user_id"], row["admin_type"]),
+        )
+    conn.commit()
+
     cur.execute("""
         CREATE TABLE IF NOT EXISTS user_filters (
             user_id INTEGER PRIMARY KEY,
@@ -2782,51 +2806,114 @@ def increment_daily_dart(user_id: int) -> int:
     conn.close()
     return row["count"]
 
-# ---------------- Role-based admins (Artist / Manager / Marzieh) ----------------
+# ---------------- Granular per-admin permissions (Artist / Manager / Marzieh) ----------------
+# A secondary admin can independently hold any combination of these (unlike
+# the old single admin_type slot) - see config.ADMIN_PERMISSIONS for the
+# canonical list with display labels, and bot.py's /admin command for the
+# give/take-access UI that calls grant_permission / revoke_permission below.
 
-def add_admin(user_id: int, admin_type: str):
+def grant_permission(user_id: int, permission: str):
     conn = get_connection()
     cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO secondary_admins (user_id, admin_type) VALUES (?, ?)
-        ON CONFLICT(user_id) DO UPDATE SET admin_type = excluded.admin_type
-    """, (user_id, admin_type.upper()))
+    cur.execute(
+        "INSERT OR IGNORE INTO admin_permissions (user_id, permission) VALUES (?, ?)",
+        (user_id, permission.upper()),
+    )
     conn.commit()
     conn.close()
 
 
-def remove_admin(user_id: int) -> bool:
+def revoke_permission(user_id: int, permission: str) -> bool:
+    """Removes one permission from one admin. Returns False if they didn't have it."""
     conn = get_connection()
     cur = conn.cursor()
-    cur.execute("SELECT 1 FROM secondary_admins WHERE user_id = ?", (user_id,))
+    cur.execute(
+        "SELECT 1 FROM admin_permissions WHERE user_id = ? AND permission = ?",
+        (user_id, permission.upper()),
+    )
     if not cur.fetchone():
         conn.close()
         return False
-    cur.execute("DELETE FROM secondary_admins WHERE user_id = ?", (user_id,))
+    cur.execute(
+        "DELETE FROM admin_permissions WHERE user_id = ? AND permission = ?",
+        (user_id, permission.upper()),
+    )
+    conn.commit()
+    conn.close()
+    return True
+
+
+def has_permission(user_id: int, permission: str) -> bool:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT 1 FROM admin_permissions WHERE user_id = ? AND permission = ?",
+        (user_id, permission.upper()),
+    )
+    row = cur.fetchone()
+    conn.close()
+    return row is not None
+
+
+def get_permissions(user_id: int) -> list:
+    """Every permission this user currently holds, e.g. ["ARTIST", "MARZIEH"]."""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT permission FROM admin_permissions WHERE user_id = ? ORDER BY permission", (user_id,))
+    rows = cur.fetchall()
+    conn.close()
+    return [row["permission"] for row in rows]
+
+
+def get_all_admins() -> list:
+    """Every user_id that currently holds at least one permission - the list /admin shows."""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT DISTINCT user_id FROM admin_permissions")
+    rows = cur.fetchall()
+    conn.close()
+    return [row["user_id"] for row in rows]
+
+
+def get_admin_type(user_id: int):
+    """Deprecated - a user can now hold multiple permissions at once, so a
+    single type no longer fully describes their access. Kept only in case
+    something outside this file still calls it; returns the first permission
+    found (if any). Prefer get_permissions() or has_permission()."""
+    perms = get_permissions(user_id)
+    return perms[0] if perms else None
+
+
+def add_admin(user_id: int, admin_type: str):
+    """Back-compat for /addadmin: grants one permission without touching any
+    others the user already holds (previously this replaced their one slot)."""
+    grant_permission(user_id, admin_type)
+
+
+def remove_admin(user_id: int) -> bool:
+    """Revokes every permission this user holds at once. Returns False if they had none."""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT 1 FROM admin_permissions WHERE user_id = ?", (user_id,))
+    if not cur.fetchone():
+        conn.close()
+        return False
+    cur.execute("DELETE FROM admin_permissions WHERE user_id = ?", (user_id,))
     conn.commit()
     conn.close()
     return True
 
 
 def remove_all_admins() -> int:
-    """Revokes every secondary admin (Artist/Manager/Marzieh) at once. Returns how many were removed."""
+    """Revokes every secondary admin's permissions at once. Returns how many admins were removed."""
     conn = get_connection()
     cur = conn.cursor()
-    cur.execute("SELECT COUNT(*) AS c FROM secondary_admins")
+    cur.execute("SELECT COUNT(DISTINCT user_id) AS c FROM admin_permissions")
     count = cur.fetchone()["c"]
-    cur.execute("DELETE FROM secondary_admins")
+    cur.execute("DELETE FROM admin_permissions")
     conn.commit()
     conn.close()
     return count
-
-
-def get_admin_type(user_id: int):
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("SELECT admin_type FROM secondary_admins WHERE user_id = ?", (user_id,))
-    row = cur.fetchone()
-    conn.close()
-    return row["admin_type"] if row else None
 
 
 # ---------------- /player (owner account management) ----------------

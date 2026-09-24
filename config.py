@@ -14,6 +14,32 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "PUT_YOUR_BOT_TOKEN_HERE")
 # (/addcharacter, /addrarity)
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "8392724333"))
 
+# --- Secondary-admin permissions (/admin, /addadmin) ---
+# Each secondary admin can independently hold any combination of these -
+# toggle them from /admin's "Give access" / "Take access" buttons. "key" is
+# what's stored in the database (keep it in sync with is_artist/is_manager/
+# is_marzieh in bot.py); "label" and "description" are only for display.
+ADMIN_PERMISSIONS = [
+    {
+        "key": "ARTIST",
+        "label": "🖌 Artist",
+        "description": "/addcharacter, /removecharacter, /editcharacter, /addrarity, /removerarity, /editrarity",
+    },
+    {
+        "key": "MANAGER",
+        "label": "🗂 Manager",
+        "description": "Everything Artist can do, plus /new, /addevent, /removeevent",
+    },
+    {
+        "key": "MARZIEH",
+        "label": "🛡 Marzieh",
+        "description": (
+            "Everything Manager can do, plus /ban, /unban, /forcespawn, /lockspawn, /unlockspawn, "
+            "/give, /player, /setsellprice, /setpremium, /removepremium, /bin"
+        ),
+    },
+]
+
 # Channel every newly added character card gets posted to (bot must be admin there)
 ARCHIVE_CHANNEL = "@gettersArchivum"
 
