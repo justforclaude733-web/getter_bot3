@@ -1784,6 +1784,25 @@ async def unban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❓ That player isn't banned.")
 
 
+async def sick_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """A canned public "burn" with zero real effect - no ban, no mute, just
+    the one fixed line below every time. Gated like /ban since it's a
+    moderation-flavored joke, not something every player should be able to
+    fire at each other."""
+    uid = update.effective_user.id
+    if not (is_admin(uid) or is_marzieh(uid)):
+        await update.message.reply_text("⛔ You're not allowed to use this command.")
+        return
+
+    if not update.message.reply_to_message or not context.args or context.args[0].lower() != "out":
+        await update.message.reply_text(
+            "⚠️ Usage: reply to the player with <code>/sick out</code>.", parse_mode=ParseMode.HTML
+        )
+        return
+
+    await update.message.reply_text("This user is nothing anymore and has completely gotten lost for good.")
+
+
 async def _block_banned_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Runs ahead of every other handler (see main()). Silently drops any
@@ -5730,6 +5749,8 @@ _HELP_MODERATION = [
      'Reply to someone with this to give them a card by ID, or currency (add "vy" after the amount).'),
     (_cmd("/player"),
      "Manage a player's account: send their @username, then add/remove a card or give/take currency."),
+    (_cmd("/sick out"),
+     "Reply to a player with this for a canned public burn - purely cosmetic, no ban or mute happens."),
 ]
 
 # Manager, Marzieh and Owner.
@@ -6020,6 +6041,7 @@ def main():
     app.add_handler(CallbackQueryHandler(player_menu_callback, pattern=r"^padmin:"))
     app.add_handler(CommandHandler("ban", ban_command))
     app.add_handler(CommandHandler("unban", unban_command))
+    app.add_handler(CommandHandler("sick", sick_command))
     app.add_handler(CommandHandler("artiststats", artist_stats_command))
     app.add_handler(CallbackQueryHandler(artist_stats_callback, pattern=r"^artiststats:"))
     app.add_handler(CommandHandler("character", character_command))
