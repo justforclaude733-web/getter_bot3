@@ -16,29 +16,50 @@ ADMIN_ID = int(os.environ.get("ADMIN_ID", "8392724333"))
 
 # --- Secondary-admin permissions (/admin, /addadmin) ---
 # Each secondary admin can independently hold any combination of these -
-# toggle them from /admin's "Give access" / "Take access" buttons. "key" is
-# what's stored in the database (keep it in sync with is_artist/is_manager/
-# is_marzieh in bot.py); "label" and "description" are only for display.
+# toggle them from /admin's "Give access" / "Take access" buttons, one
+# specific command at a time. "key" is what's stored in the database (keep
+# it in sync with the has_command_permission() calls in bot.py); "label" and
+# "description" are only for display.
 ADMIN_PERMISSIONS = [
-    {
-        "key": "ARTIST",
-        "label": "🖌 Artist",
-        "description": "/addcharacter, /removecharacter, /editcharacter, /addrarity, /removerarity, /editrarity",
-    },
-    {
-        "key": "MANAGER",
-        "label": "🗂 Manager",
-        "description": "Everything Artist can do, plus /new, /addevent, /removeevent",
-    },
-    {
-        "key": "MARZIEH",
-        "label": "🛡 Marzieh",
-        "description": (
-            "Everything Manager can do, plus /ban, /unban, /forcespawn, /lockspawn, /unlockspawn, "
-            "/give, /player, /setsellprice, /setpremium, /removepremium, /bin"
-        ),
-    },
+    {"key": "ADDCHARACTER", "label": "/addcharacter", "description": "Add a new character card."},
+    {"key": "REMOVECHARACTER", "label": "/removecharacter", "description": "Remove a character card."},
+    {"key": "EDITCHARACTER", "label": "/editcharacter", "description": "Edit an existing character's details."},
+    {"key": "ADDRARITY", "label": "/addrarity", "description": "Create or update a rarity tier."},
+    {"key": "REMOVERARITY", "label": "/removerarity", "description": "Remove a rarity tier."},
+    {"key": "EDITRARITY", "label": "/editrarity", "description": "Change a rarity tier's weight."},
+    {"key": "NEW", "label": "/new", "description": "Publish a post to the announcement channel."},
+    {"key": "ADDEVENT", "label": "/addevent", "description": "Register a new event name."},
+    {"key": "REMOVEEVENT", "label": "/removeevent", "description": "Unregister an event."},
+    {"key": "REVIEWSUBMISSIONS", "label": "Review /send", "description": "Approve or reject /send submissions."},
+    {"key": "FORCESPAWN", "label": "/forcespawn", "description": "Instantly spawn a random character."},
+    {"key": "LOCKSPAWN", "label": "/lockspawn", "description": "Stop a rarity or event from spawning."},
+    {"key": "UNLOCKSPAWN", "label": "/unlockspawn", "description": "Re-allow a locked rarity or event to spawn."},
+    {"key": "BAN", "label": "/ban", "description": "Ban a player from using the bot."},
+    {"key": "UNBAN", "label": "/unban", "description": "Lift a player's ban."},
+    {"key": "SICK", "label": "/sick out", "description": "Send the canned public burn - purely cosmetic."},
+    {"key": "GIVE", "label": "/give", "description": "Give a player a card or currency."},
+    {"key": "PLAYER", "label": "/player", "description": "Manage a player's cards and currency."},
+    {"key": "SETPREMIUM", "label": "/setpremium", "description": "Grant a player premium."},
+    {"key": "REMOVEPREMIUM", "label": "/removepremium", "description": "Revoke a player's premium."},
+    {"key": "SETSELLPRICE", "label": "/setsellprice", "description": "Set the /sellbot payout for a rarity."},
+    {"key": "BIN", "label": "/bin", "description": "Browse and restore recently deleted items."},
 ]
+
+# Historical bundle shortcuts for /addadmin's old "artist/manager/marzieh"
+# syntax, and for migrating anyone who held one of those tiers before this
+# per-command system existed (see the migration in database.py's init_db).
+# Each bundle lists exactly the permission keys that old tier used to imply.
+_ARTIST_BUNDLE = ["ADDCHARACTER", "REMOVECHARACTER", "EDITCHARACTER", "ADDRARITY", "REMOVERARITY", "EDITRARITY"]
+_MANAGER_BUNDLE = _ARTIST_BUNDLE + ["NEW", "ADDEVENT", "REMOVEEVENT"]
+_MARZIEH_BUNDLE = _MANAGER_BUNDLE + [
+    "REVIEWSUBMISSIONS", "FORCESPAWN", "LOCKSPAWN", "UNLOCKSPAWN", "BAN", "UNBAN", "SICK",
+    "GIVE", "PLAYER", "SETPREMIUM", "REMOVEPREMIUM", "SETSELLPRICE", "BIN",
+]
+ADMIN_TYPE_BUNDLES = {
+    "ARTIST": _ARTIST_BUNDLE,
+    "MANAGER": _MANAGER_BUNDLE,
+    "MARZIEH": _MARZIEH_BUNDLE,
+}
 
 # Channel every newly added character card gets posted to (bot must be admin there)
 ARCHIVE_CHANNEL = "@gettersArchivum"
@@ -241,10 +262,6 @@ EVENT_PRICE_TIERS = [
         "events": ["🎮𝗚𝗮𝗺𝗲𝗿🎮", "📚𝗦𝗰𝗵𝗼𝗼𝗹📚", "🏓𝗦𝗽𝗼𝗿𝘁🏓", "😭𝗖𝗿𝘆😭", "🛡𝗙𝗶𝗴𝗵𝘁𝗲𝗿🛡"],
     },
 ]
-
-# /send submissions: the rarity tiers a Manager may approve (Marzieh and the owner can
-# approve any). Matched by tier name, so emoji / styling in the rarity's name don't matter.
-MANAGER_APPROVABLE_RARITIES = ("Common", "Rare", "Mystic", "Legendary", "Elysian")
 
 # ==================== Player memories & nightly engagement ====================
 # How often (seconds) the nightly job runs. It handles two things each

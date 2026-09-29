@@ -16,7 +16,7 @@ from config import (
     FIGHTER_MAX_LEVEL, ARENA_BATTLE_DURATION_SECONDS, ARENA_LEAGUES,
     ARENA_MATCH_UP_CHANCE, ARENA_MATCH_DOWN_CHANCE, ARENA_NPC_OPPONENTS,
     ARENA_NPC_IDS, DAILY_TASK_BONUS, PREMIUM_DAILY_TASK_BONUS,
-    PRICE_CHECK_DEDUP_WINDOW_SECONDS,
+    PRICE_CHECK_DEDUP_WINDOW_SECONDS, ADMIN_TYPE_BUNDLES,
 )
 
 
@@ -204,15 +204,20 @@ def init_db():
         )
     """)
 
-    # One-time carry-over: anyone who already had a single admin_type keeps
-    # that same access as their first granted permission. Safe to run on
-    # every startup - INSERT OR IGNORE makes it a no-op once migrated.
+    # One-time carry-over: permissions used to be one exclusive role
+    # (Artist/Manager/Marzieh); now each command is its own independent
+    # permission (see config.ADMIN_PERMISSIONS). Expand whatever role
+    # someone already had into every permission that role used to imply,
+    # so nobody loses access on upgrade. Safe to run on every startup -
+    # INSERT OR IGNORE makes it a no-op once migrated.
     cur.execute("SELECT user_id, admin_type FROM secondary_admins WHERE admin_type IS NOT NULL")
     for row in cur.fetchall():
-        cur.execute(
-            "INSERT OR IGNORE INTO admin_permissions (user_id, permission) VALUES (?, ?)",
-            (row["user_id"], row["admin_type"]),
-        )
+        bundle = ADMIN_TYPE_BUNDLES.get(row["admin_type"], [row["admin_type"]])
+        for permission in bundle:
+            cur.execute(
+                "INSERT OR IGNORE INTO admin_permissions (user_id, permission) VALUES (?, ?)",
+                (row["user_id"], permission),
+            )
     conn.commit()
 
     cur.execute("""
@@ -2882,12 +2887,6 @@ def get_admin_type(user_id: int):
     found (if any). Prefer get_permissions() or has_permission()."""
     perms = get_permissions(user_id)
     return perms[0] if perms else None
-
-
-def add_admin(user_id: int, admin_type: str):
-    """Back-compat for /addadmin: grants one permission without touching any
-    others the user already holds (previously this replaced their one slot)."""
-    grant_permission(user_id, admin_type)
 
 
 def remove_admin(user_id: int) -> bool:

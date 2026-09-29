@@ -228,16 +228,10 @@ def is_admin(user_id: int) -> bool:
     return user_id == config.ADMIN_ID
 
 
-def is_artist(user_id: int) -> bool:
-    return db.has_permission(user_id, "ARTIST")
-
-
-def is_manager(user_id: int) -> bool:
-    return db.has_permission(user_id, "MANAGER")
-
-
-def is_marzieh(user_id: int) -> bool:
-    return db.has_permission(user_id, "MARZIEH")
+def has_command_permission(user_id: int, permission: str) -> bool:
+    """Owner always passes; anyone else needs this specific permission
+    (see config.ADMIN_PERMISSIONS) granted via /admin or /addadmin."""
+    return is_admin(user_id) or db.has_permission(user_id, permission)
 
 
 def _volume_dir() -> str:
@@ -1351,7 +1345,7 @@ async def stats_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def give_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    if not (is_admin(uid) or is_marzieh(uid)):
+    if not has_command_permission(uid, "GIVE"):
         await update.message.reply_text("⛔ You're not allowed to use this command.")
         return
 
@@ -1510,7 +1504,7 @@ def _player_menu_keyboard():
 
 async def player_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    if not (is_admin(uid) or is_marzieh(uid)):
+    if not has_command_permission(uid, "PLAYER"):
         await update.message.reply_text("⛔ You're not allowed to use this command.")
         return
 
@@ -1561,7 +1555,7 @@ async def player_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     await query.answer()
 
     uid = query.from_user.id
-    if not (is_admin(uid) or is_marzieh(uid)):
+    if not has_command_permission(uid, "PLAYER"):
         await query.edit_message_text("⛔ You're not allowed to use this.")
         return
 
@@ -1703,7 +1697,7 @@ async def capture_player_input(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def ban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    if not (is_admin(uid) or is_marzieh(uid)):
+    if not has_command_permission(uid, "BAN"):
         await update.message.reply_text("⛔ You're not allowed to use this command.")
         return
 
@@ -1759,7 +1753,7 @@ async def ban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def unban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    if not (is_admin(uid) or is_marzieh(uid)):
+    if not has_command_permission(uid, "UNBAN"):
         await update.message.reply_text("⛔ You're not allowed to use this command.")
         return
 
@@ -1790,7 +1784,7 @@ async def sick_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     moderation-flavored joke, not something every player should be able to
     fire at each other."""
     uid = update.effective_user.id
-    if not (is_admin(uid) or is_marzieh(uid)):
+    if not has_command_permission(uid, "SICK"):
         await update.message.reply_text("⛔ You're not allowed to use this command.")
         return
 
@@ -2002,7 +1996,7 @@ async def character_stats_callback(update: Update, context: ContextTypes.DEFAULT
 
 async def set_premium_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    if not (is_admin(uid) or is_marzieh(uid)):
+    if not has_command_permission(uid, "SETPREMIUM"):
         await update.message.reply_text("⛔ You're not allowed to use this command.")
         return
 
@@ -2040,7 +2034,7 @@ async def set_premium_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def remove_premium_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    if not (is_admin(uid) or is_marzieh(uid)):
+    if not has_command_permission(uid, "REMOVEPREMIUM"):
         await update.message.reply_text("⛔ You're not allowed to use this command.")
         return
 
@@ -2435,7 +2429,7 @@ async def sellbot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def set_sell_price_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    if not (is_admin(user.id) or is_marzieh(user.id)):
+    if not has_command_permission(user.id, "SETSELLPRICE"):
         await update.message.reply_text("⛔ You're not allowed to use this command.")
         return
 
@@ -3310,7 +3304,7 @@ def _extract_media(message):
 
 async def add_character_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    if not (is_admin(user.id) or is_artist(user.id) or is_manager(user.id) or is_marzieh(user.id)):
+    if not has_command_permission(user.id, "ADDCHARACTER"):
         await update.message.reply_text("⛔ You're not allowed to use this command.")
         return
 
@@ -3367,7 +3361,7 @@ async def add_character_command(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def add_rarity_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    if not (is_admin(user.id) or is_artist(user.id) or is_manager(user.id) or is_marzieh(user.id)):
+    if not has_command_permission(user.id, "ADDRARITY"):
         await update.message.reply_text("⛔ You're not allowed to use this command.")
         return
 
@@ -3394,7 +3388,7 @@ async def add_rarity_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def remove_character_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    if not (is_admin(user.id) or is_artist(user.id) or is_manager(user.id) or is_marzieh(user.id)):
+    if not has_command_permission(user.id, "REMOVECHARACTER"):
         await update.message.reply_text("⛔ You're not allowed to use this command.")
         return
 
@@ -3488,7 +3482,7 @@ async def spawn_status_command(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def remove_rarity_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    if not (is_admin(user.id) or is_artist(user.id) or is_manager(user.id) or is_marzieh(user.id)):
+    if not has_command_permission(user.id, "REMOVERARITY"):
         await update.message.reply_text("⛔ You're not allowed to use this command.")
         return
 
@@ -3525,7 +3519,7 @@ async def remove_rarity_command(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def force_spawn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    if not (is_admin(user.id) or is_marzieh(user.id)):
+    if not has_command_permission(user.id, "FORCESPAWN"):
         await update.message.reply_text("⛔ You're not allowed to use this command.")
         return
 
@@ -3758,8 +3752,9 @@ async def add_admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    admin_type = context.args[0].lower()
-    if admin_type not in ("artist", "manager", "marzieh"):
+    admin_type = context.args[0].upper()
+    bundle = config.ADMIN_TYPE_BUNDLES.get(admin_type)
+    if not bundle:
         await update.message.reply_text("⚠️ Type must be \"artist\", \"manager\", or \"marzieh\".")
         return
 
@@ -3769,9 +3764,12 @@ async def add_admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ ID must be a number.")
         return
 
-    db.add_admin(new_admin_id, admin_type)
+    for permission in bundle:
+        db.grant_permission(new_admin_id, permission)
     await update.message.reply_text(
-        f"✅ User <code>{new_admin_id}</code> is now admin type {admin_type.capitalize()}.", parse_mode=ParseMode.HTML
+        f"✅ User <code>{new_admin_id}</code> now has {admin_type.capitalize()} access "
+        f"({len(bundle)} permissions - see /admin to fine-tune).",
+        parse_mode=ParseMode.HTML,
     )
 
 
@@ -4189,7 +4187,7 @@ def _new_post_keyboard(post_id: int, buttons, showing: str = "en"):
 
 async def new_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    if not (is_admin(user.id) or is_manager(user.id) or is_marzieh(user.id)):
+    if not has_command_permission(user.id, "NEW"):
         await update.message.reply_text("⛔ You're not allowed to use this command.")
         return
 
@@ -4389,8 +4387,8 @@ async def new_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("⚠️ This button type is not supported.", show_alert=True)
         return
 
-    if not (is_admin(user.id) or is_manager(user.id) or is_marzieh(user.id)):
-        await query.answer("⛔ Only the owner, managers, and Marzieh can use this.", show_alert=True)
+    if not has_command_permission(user.id, "NEW"):
+        await query.answer("⛔ You're not allowed to use this.", show_alert=True)
         return
 
     flow_id = data[2]
@@ -4461,7 +4459,7 @@ async def new_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def capture_new_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    if not user or not is_admin(user.id) or not update.message or not update.message.text:
+    if not user or not has_command_permission(user.id, "NEW") or not update.message or not update.message.text:
         return
     flow_id = await _new_flow_id_for_user(user.id)
     if not flow_id:
@@ -4592,17 +4590,6 @@ def build_submission_keyboard(submission_id: str) -> InlineKeyboardMarkup:
     ])
 
 
-def _manager_can_approve_rarity(rarity_name) -> bool:
-    """Managers may only approve the cheaper tiers (config.MANAGER_APPROVABLE_RARITIES)."""
-    return bool(rarity_name) and economy.match_price_tier(rarity_name) in config.MANAGER_APPROVABLE_RARITIES
-
-
-_MANAGER_LIMIT_TEXT = (
-    "⛔ Managers can only approve Common, Rare, Mystic, Legendary and Elysian cards. "
-    "Ask Marzieh or the owner to review this one."
-)
-
-
 async def _deliver_submission(context, submission_id: str, media_type: str, file_id: str, caption: str) -> int:
     """Posts a submission's review panel to the owner's DM and to the review group (if one
     is set), remembering each message so they can all be closed once the card is handled.
@@ -4656,9 +4643,8 @@ async def set_review_group_command(update: Update, context: ContextTypes.DEFAULT
     db.set_review_group(chat.id, chat.title)
     await update.message.reply_text(
         "✅ This group is now the submission review group.\n"
-        "New /send submissions appear here and in the owner's DM. Marzieh can approve any of them; "
-        "managers only Common, Rare, Mystic, Legendary and Elysian cards. "
-        "Once one is handled, the panel closes everywhere."
+        "New /send submissions appear here and in the owner's DM, for anyone with Review /send "
+        "access (see /admin). Once one is handled, the panel closes everywhere."
     )
 
 
@@ -4666,10 +4652,8 @@ async def submission_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     query = update.callback_query
     user = query.from_user
 
-    is_owner = is_admin(user.id)
-    can_approve_everything = is_owner or is_marzieh(user.id)
-    if not (can_approve_everything or is_manager(user.id)):
-        await query.answer("⛔ Only the owner, Marzieh and managers can review submissions.", show_alert=True)
+    if not has_command_permission(user.id, "REVIEWSUBMISSIONS"):
+        await query.answer("⛔ You're not allowed to use this.", show_alert=True)
         return
 
     parts = query.data.split(":")
@@ -4684,18 +4668,9 @@ async def submission_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         return
 
-    # Managers only handle the cheaper tiers - checked here, not just by hiding buttons.
-    if not can_approve_everything and submission["rarity_name"] and not _manager_can_approve_rarity(
-        submission["rarity_name"]
-    ):
-        await query.answer(_MANAGER_LIMIT_TEXT, show_alert=True)
-        return
-
     # Swap the two buttons for the rarity picker
     if action == "rarity":
         rarities = db.list_rarities()
-        if not can_approve_everything:
-            rarities = [r for r in rarities if _manager_can_approve_rarity(r["name"])]
         if not rarities:
             await query.answer("❓ No rarities defined yet - use /addrarity first.", show_alert=True)
             return
@@ -4717,17 +4692,11 @@ async def submission_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     if action == "add":
         # Use whatever rarity (if any) was already in the /send caption
         rarity_name = submission["rarity_name"]
-        if not can_approve_everything and not rarity_name:
-            await query.answer("⚠️ This card has no rarity yet - tap 🏷 Choose rarity first.", show_alert=True)
-            return
     elif action == "setrarity":
         # Same character, but the reviewer's chosen rarity overrides it
         rarity_id = int(parts[3])
         rarity_row = db.get_rarity_by_id(rarity_id)
         rarity_name = rarity_row["name"] if rarity_row else None
-        if not can_approve_everything and not _manager_can_approve_rarity(rarity_name):
-            await query.answer(_MANAGER_LIMIT_TEXT, show_alert=True)
-            return
     else:
         await query.answer()
         return
@@ -4853,7 +4822,7 @@ async def send_character_command(update: Update, context: ContextTypes.DEFAULT_T
 
 async def edit_rarity_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    if not (is_admin(user.id) or is_artist(user.id) or is_manager(user.id) or is_marzieh(user.id)):
+    if not has_command_permission(user.id, "EDITRARITY"):
         await update.message.reply_text("⛔ You're not allowed to use this command.")
         return
 
@@ -4875,7 +4844,7 @@ async def edit_rarity_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def edit_character_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    if not (is_admin(user.id) or is_artist(user.id) or is_manager(user.id) or is_marzieh(user.id)):
+    if not has_command_permission(user.id, "EDITCHARACTER"):
         await update.message.reply_text("⛔ You're not allowed to use this command.")
         return
 
@@ -4918,7 +4887,7 @@ async def edit_character_field_callback(update: Update, context: ContextTypes.DE
     already exists."""
     query = update.callback_query
     user = query.from_user
-    if not (is_admin(user.id) or is_artist(user.id) or is_manager(user.id) or is_marzieh(user.id)):
+    if not has_command_permission(user.id, "EDITCHARACTER"):
         await query.answer("⛔ You're not allowed to use this.", show_alert=True)
         return
     await query.answer()
@@ -4975,7 +4944,7 @@ async def edit_character_apply_callback(update: Update, context: ContextTypes.DE
     already were."""
     query = update.callback_query
     user = query.from_user
-    if not (is_admin(user.id) or is_artist(user.id) or is_manager(user.id) or is_marzieh(user.id)):
+    if not has_command_permission(user.id, "EDITCHARACTER"):
         await query.answer("⛔ You're not allowed to use this.", show_alert=True)
         return
     await query.answer()
@@ -5126,7 +5095,7 @@ def _canonical_event_name(name: str) -> str:
 
 async def _spawn_lock_command(update: Update, context: ContextTypes.DEFAULT_TYPE, lock: bool):
     user = update.effective_user
-    if not (is_admin(user.id) or is_marzieh(user.id)):
+    if not has_command_permission(user.id, "LOCKSPAWN" if lock else "UNLOCKSPAWN"):
         await update.message.reply_text("⛔ You're not allowed to use this command.")
         return
 
@@ -5184,11 +5153,11 @@ async def unlock_spawn_command(update: Update, context: ContextTypes.DEFAULT_TYP
     await _spawn_lock_command(update, context, lock=False)
 
 
-# ---------------- Admin: /addevent & /removeevent (owner only) ----------------
+# ---------------- Admin: /addevent & /removeevent ----------------
 
 async def add_event_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    if not (is_admin(user.id) or is_manager(user.id) or is_marzieh(user.id)):
+    if not has_command_permission(user.id, "ADDEVENT"):
         await update.message.reply_text("⛔ You're not allowed to use this command.")
         return
 
@@ -5210,7 +5179,7 @@ async def add_event_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def remove_event_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    if not (is_admin(user.id) or is_manager(user.id) or is_marzieh(user.id)):
+    if not has_command_permission(user.id, "REMOVEEVENT"):
         await update.message.reply_text("⛔ You're not allowed to use this command.")
         return
 
@@ -5298,7 +5267,7 @@ def _bin_category_text_and_keyboard(kind: str):
 
 async def bin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    if not (is_admin(uid) or is_marzieh(uid)):
+    if not has_command_permission(uid, "BIN"):
         await update.message.reply_text("⛔ You're not allowed to use this command.")
         return
 
@@ -5309,8 +5278,8 @@ async def bin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def bin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     uid = query.from_user.id
-    if not (is_admin(uid) or is_marzieh(uid)):
-        await query.answer("⛔ Only the bot owner can use this.", show_alert=True)
+    if not has_command_permission(uid, "BIN"):
+        await query.answer("⛔ You're not allowed to use this.", show_alert=True)
         return
 
     parts = query.data.split(":")
@@ -5712,14 +5681,16 @@ _EDIT_RARITY = (
     "Change a rarity's weight (bot will ask you to type the new number).",
 )
 
-# Artist, Manager and Marzieh.
+# Each entry tagged with the one permission it needs (see config.ADMIN_PERMISSIONS
+# and /admin) - build_help_text filters these down to whatever a given secondary
+# admin actually holds. The owner always sees the untagged _OWNER variants instead.
 _HELP_CARD_EDITING = [
-    _ADD_CHARACTER,
-    (_cmd("/removecharacter [ID]"), 'Remove a character (can\'t use "all").'),
-    _EDIT_CHARACTER,
-    _ADD_RARITY,
-    (_cmd("/removerarity [name]"), "Remove one rarity tier."),
-    _EDIT_RARITY,
+    ("ADDCHARACTER",) + _ADD_CHARACTER,
+    ("REMOVECHARACTER", _cmd("/removecharacter [ID]"), 'Remove a character (can\'t use "all").'),
+    ("EDITCHARACTER",) + _EDIT_CHARACTER,
+    ("ADDRARITY",) + _ADD_RARITY,
+    ("REMOVERARITY", _cmd("/removerarity [name]"), "Remove one rarity tier."),
+    ("EDITRARITY",) + _EDIT_RARITY,
 ]
 
 # Owner: same tools, but "all" is allowed.
@@ -5734,36 +5705,34 @@ _HELP_CARD_EDITING_OWNER = [
     _EDIT_RARITY,
 ]
 
-# Marzieh and Owner (managers don't get spawn or player tools).
 _HELP_MODERATION = [
-    (_cmd("/ban", "/ban [days]", "/ban [user ID] [days]"),
+    ("BAN", _cmd("/ban", "/ban [days]", "/ban [user ID] [days]"),
      "Reply to a player (or give their ID) to ban them - permanent if no days given."),
-    (_cmd("/unban", "/unban [user ID]"), "Reply to a banned player (or give their ID) to lift their ban."),
-    (_cmd("/forcespawn"), "Instantly spawn a random character in the current group."),
-    (_cmd("/lockspawn [rarity or event]", "/lockspawn main [rarity or event]"),
+    ("UNBAN", _cmd("/unban", "/unban [user ID]"), "Reply to a banned player (or give their ID) to lift their ban."),
+    ("FORCESPAWN", _cmd("/forcespawn"), "Instantly spawn a random character in the current group."),
+    ("LOCKSPAWN", _cmd("/lockspawn [rarity or event]", "/lockspawn main [rarity or event]"),
      "Stop a rarity tier or event's cards from spawning. Multiple locks can be active at once. "
      "With <code>main</code> the lock only applies to the main group (the /setforcejoin one)."),
-    (_cmd("/unlockspawn [rarity or event]", "/unlockspawn main [rarity or event]"),
+    ("UNLOCKSPAWN", _cmd("/unlockspawn [rarity or event]", "/unlockspawn main [rarity or event]"),
      "Re-allow a locked rarity or event to spawn again (with <code>main</code>: only in the main group)."),
-    (_cmd("/give [ID]", "/give [amount] vy"),
+    ("GIVE", _cmd("/give [ID]", "/give [amount] vy"),
      'Reply to someone with this to give them a card by ID, or currency (add "vy" after the amount).'),
-    (_cmd("/player"),
+    ("PLAYER", _cmd("/player"),
      "Manage a player's account: send their @username, then add/remove a card or give/take currency."),
-    (_cmd("/sick out"),
+    ("SICK", _cmd("/sick out"),
      "Reply to a player with this for a canned public burn - purely cosmetic, no ban or mute happens."),
 ]
 
-# Manager, Marzieh and Owner.
 _HELP_NEW = [
-    (_cmd("/new"),
+    ("NEW", _cmd("/new"),
      "Write a post (Persian + English, optional buttons) and publish it to the announcement channel - "
      "it appears in English with a 🌐 Translate button for the Persian text."),
 ]
 
-# Manager and Marzieh (the owner has the same two, with "all" - see below).
+# Owner has the same two, with "all" - see _HELP_EVENTS_OWNER below.
 _HELP_EVENTS = [
-    (_cmd("/addevent [name]"), "Register a new event name so it can be tagged onto characters."),
-    (_cmd("/removeevent [name]"),
+    ("ADDEVENT", _cmd("/addevent [name]"), "Register a new event name so it can be tagged onto characters."),
+    ("REMOVEEVENT", _cmd("/removeevent [name]"),
      "Unregister an event (recoverable from /bin for 30 days). Only the owner can wipe them all at once."),
 ]
 
@@ -5773,15 +5742,16 @@ _HELP_EVENTS_OWNER = [
      "Unregister an event, or wipe all of them at once (recoverable from /bin for 30 days)."),
 ]
 
-# Marzieh and Owner.
-_HELP_MARZIEH_TOOLS = [
-    (_cmd("/setsellprice [rarity name] [amount]"),
+_HELP_ADVANCED_TOOLS = [
+    ("REVIEWSUBMISSIONS", "<b>Review /send submissions</b>",
+     "Approve or reject characters submitted via /send, and set their final rarity and event."),
+    ("SETSELLPRICE", _cmd("/setsellprice [rarity name] [amount]"),
      "Set how much currency players get for selling a card of that rarity to the bot with /sellbot "
      '(use "Unranked" for characters with no rarity). No args shows current prices.'),
-    (_cmd("/setpremium", "/setpremium [days]"),
+    ("SETPREMIUM", _cmd("/setpremium", "/setpremium [days]"),
      "Reply to someone to grant premium - permanent if no days given, or for that many days."),
-    (_cmd("/removepremium"), "Reply to someone to revoke their premium."),
-    (_cmd("/bin"),
+    ("REMOVEPREMIUM", _cmd("/removepremium"), "Reply to someone to revoke their premium."),
+    ("BIN", _cmd("/bin"),
      "Browse characters, rarities, and events deleted in the last 30 days, and restore them "
      "one by one or all at once."),
 ]
@@ -5789,8 +5759,10 @@ _HELP_MARZIEH_TOOLS = [
 # Owner only.
 _HELP_OWNER_ONLY = [
     (_cmd("/admin"),
-     "Browse admins with buttons and give/take Artist, Manager, or Marzieh access one permission at a time."),
-    (_cmd("/addadmin [artist|manager|marzieh] [ID]"), "Grant a user Artist, Manager, or Marzieh access."),
+     "Browse admins with buttons and give/take individual command permissions (like /bin or /ban) one at a time."),
+    (_cmd("/addadmin [artist|manager|marzieh] [ID]"),
+     "Shortcut: grants a whole bundle of permissions matching the old Artist/Manager/Marzieh tiers at once "
+     "(use /admin instead for one-by-one control)."),
     (_cmd("/removeadmin [ID or \"all\"]"),
      "Revoke a user's admin access, or every secondary admin at once."),
     (_cmd("/stats"), "See how many users and groups the bot has, with buttons to list them."),
@@ -5806,8 +5778,7 @@ _HELP_OWNER_ONLY = [
     (_cmd("/setforcejoin"),
      "Run it inside a group to make membership in that group required before anyone can use the bot."),
     (_cmd("/setreviewgroup", "/setreviewgroup off"),
-     "Run it inside a group to also post /send submissions there for review (Marzieh approves any, "
-     "managers only Common-Elysian); with off they go to your DM only."),
+     "Run it inside a group to also post /send submissions there for review; with off they go to your DM only."),
     (_cmd("/filedown"), "Download a .tar.gz backup of the whole data volume."),
     (_cmd("/fileup"), "Restore a /filedown backup onto the volume (overwrites everything currently there)."),
 ]
@@ -5824,22 +5795,31 @@ def _help_section(title: str, *entry_lists) -> list:
     return blocks
 
 
+def _filter_tagged(entries, held: set) -> list:
+    """Strips the permission tag, keeping only entries this specific admin holds."""
+    return [(cmd, desc) for perm, cmd, desc in entries if perm in held]
+
+
 def build_help_text(user_id: int) -> str:
     blocks = ["📖 <b>Commands</b>"] + _help_blocks(_HELP_PLAYER)
 
-    if is_artist(user_id):
-        blocks += _help_section("Artist", _HELP_CARD_EDITING)
-    if is_manager(user_id):
-        blocks += _help_section("Manager", _HELP_NEW, _HELP_EVENTS, _HELP_CARD_EDITING)
-    if is_marzieh(user_id):
-        blocks += _help_section(
-            "Marzieh", _HELP_MODERATION, _HELP_NEW, _HELP_EVENTS, _HELP_CARD_EDITING, _HELP_MARZIEH_TOOLS,
-        )
     if is_admin(user_id):
         blocks += _help_section(
             "Owner only", _HELP_CARD_EDITING_OWNER, _HELP_MODERATION, _HELP_NEW, _HELP_EVENTS_OWNER,
-            _HELP_MARZIEH_TOOLS, _HELP_OWNER_ONLY,
+            _HELP_ADVANCED_TOOLS, _HELP_OWNER_ONLY,
         )
+    else:
+        held = set(db.get_permissions(user_id))
+        if held:
+            sections = [
+                ("Card editing", _filter_tagged(_HELP_CARD_EDITING, held)),
+                ("Posts & events", _filter_tagged(_HELP_NEW + _HELP_EVENTS, held)),
+                ("Moderation", _filter_tagged(_HELP_MODERATION, held)),
+                ("Other tools", _filter_tagged(_HELP_ADVANCED_TOOLS, held)),
+            ]
+            for title, entries in sections:
+                if entries:
+                    blocks += _help_section(title, entries)
 
     return "\n\n".join(blocks)
 
@@ -5865,11 +5845,11 @@ def _chunk_help_text(text: str, limit: int = 3500):
 
 
 async def _deliver_help(user_id: int, chat, context: ContextTypes.DEFAULT_TYPE):
-    """Sends the /help output. Marzieh's section lists sensitive admin
-    commands, so if she asks for /help anywhere other than her own DM,
-    we tease her in that chat instead of showing it there, and quietly
-    send the real thing to her private chat."""
-    if is_marzieh(user_id) and chat.type != "private":
+    """Sends the /help output. A secondary admin's section lists sensitive
+    admin commands, so if anyone holding at least one admin permission asks
+    for /help anywhere other than their own DM, we tease them in that chat
+    instead of showing it there, and quietly send the real thing to DM."""
+    if not is_admin(user_id) and db.get_permissions(user_id) and chat.type != "private":
         try:
             for chunk in _chunk_help_text(build_help_text(user_id)):
                 await context.bot.send_message(chat_id=user_id, text=chunk, parse_mode=ParseMode.HTML)
