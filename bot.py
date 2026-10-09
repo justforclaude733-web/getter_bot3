@@ -627,12 +627,6 @@ async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------------- /get ----------------
 
-def _ordinal(n: int) -> str:
-    """1 -> 1st, 2 -> 2nd, 3 -> 3rd, 4 -> 4th, 11 -> 11th, 22 -> 22nd ..."""
-    if 10 <= n % 100 <= 13:
-        return f"{n}th"
-    return f"{n}{ {1: 'st', 2: 'nd', 3: 'rd'}.get(n % 10, 'th') }"
-
 
 async def get_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -694,15 +688,14 @@ async def get_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # The claim above already added this copy, so 2+ means they had it before.
     copies = db.count_user_copies(user.id, character["id"])
-    repeat_line = f"🔁 You got this card for the {_ordinal(copies)} time!\n\n" if copies >= 2 else ""
+    count_suffix = f" x{copies}" if copies >= 2 else ""
 
     text = (
         f"✨ <b>{claimer_name}</b> has got a celestial relic!\n\n"
-        f"𝛮ame: <b>{character['name']}</b>\n"
+        f"𝛮ame: <b>{character['name']}</b>{count_suffix}\n"
         f"𝛢nime: {character['series']}\n"
         f"𝛪𝐷: #{character['id']}\n"
         f"R𝛼rity: {rarity_text}\n\n"
-        f"{repeat_line}"
         f"🌌 A new relic now shines among your constellations\n"
         f"Daily capture: {daily_count}/{capture_limit}"
     )
