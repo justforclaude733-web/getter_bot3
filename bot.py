@@ -627,6 +627,13 @@ async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------------- /get ----------------
 
+def _ordinal(n: int) -> str:
+    """1 -> 1st, 2 -> 2nd, 3 -> 3rd, 4 -> 4th, 11 -> 11th, 22 -> 22nd ..."""
+    if 10 <= n % 100 <= 13:
+        return f"{n}th"
+    return f"{n}{ {1: 'st', 2: 'nd', 3: 'rd'}.get(n % 10, 'th') }"
+
+
 async def get_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     user = update.effective_user
@@ -685,12 +692,17 @@ async def get_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rarity_text = character["rarity_name"] if character["rarity_name"] else "Unranked"
     claimer_name = _mention(user.id, user.first_name)
 
+    # The claim above already added this copy, so 2+ means they had it before.
+    copies = db.count_user_copies(user.id, character["id"])
+    repeat_line = f"🔁 You got this card for the {_ordinal(copies)} time!\n\n" if copies >= 2 else ""
+
     text = (
         f"✨ <b>{claimer_name}</b> has got a celestial relic!\n\n"
         f"𝛮ame: <b>{character['name']}</b>\n"
         f"𝛢nime: {character['series']}\n"
         f"𝛪𝐷: #{character['id']}\n"
         f"R𝛼rity: {rarity_text}\n\n"
+        f"{repeat_line}"
         f"🌌 A new relic now shines among your constellations\n"
         f"Daily capture: {daily_count}/{capture_limit}"
     )
@@ -710,6 +722,11 @@ async def get_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 CONSTELLATION_PAGE_SIZE = 8
 
 
+def _rarity_rank_map() -> dict:
+    """{rarity name: position} with the rarest tier at 0 (same order as /rarities)."""
+    return {r["name"]: i for i, r in enumerate(sorted(db.list_rarities(), key=_rarity_list_order))}
+
+
 def build_constellation_page(owner_id: int, owner_display_name: str, page: int):
     """Returns (text, keyboard) for one page of the constellation menu."""
     items = db.get_user_inventory(owner_id)
@@ -723,9 +740,23 @@ def build_constellation_page(owner_id: int, owner_display_name: str, page: int):
         series_list = grouped.setdefault(item["series"], {})
         series_list.setdefault(cid, item)
 
+    # Rarest first. Cards stay grouped by series (one header per series); inside a
+    # series the rarest card comes first, and the series holding the rarest card
+    # comes first. Python's sort is stable, so ties keep their "newest first" order.
+    rank = _rarity_rank_map()
+    unranked = len(rank)
+
+    def _card_rank(card):
+        return rank.get(card["rarity_name"], unranked)
+
+    ordered_series = sorted(
+        grouped.items(),
+        key=lambda kv: min(_card_rank(c) for c in kv[1].values()),
+    )
+
     flat_entries = []  # (series, item) pairs, series-contiguous
-    for series, chars_by_id in grouped.items():
-        for item in chars_by_id.values():
+    for series, chars_by_id in ordered_series:
+        for item in sorted(chars_by_id.values(), key=_card_rank):
             flat_entries.append((series, item))
 
     unique_count = len(flat_entries)
@@ -2665,7 +2696,7 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔍 View search results", switch_inline_query_current_chat=f"search:{query}")]
+        [InlineKeyboardButton("🔍 View search results", switch_inline_query_current_chat=query)]
     ])
     await update.message.reply_text(
         "Click the button below to see the search results:", reply_markup=keyboard
@@ -2920,42 +2951,57 @@ async def capture_sort_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def constellation_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Powers both:
-    - '📸 See constellation' button -> '@yourbot constellation:<owner_id>'
-    - '🔍 View search results' button -> '@yourbot search:<query>'
-    Returns matching characters as a scrollable native Telegram photo
-    gallery - nothing gets posted in the chat itself unless the person
-    taps a specific photo to send it.
+    Powers the inline gallery:
+    - '🌌 See constellation' button -> '@yourbot constellation:<owner_id>'
+      (the player's WHOLE collection - /sort filters only affect the /constellation
+      list, never this gallery; each card shows once, with xN in its caption)
+    - '@yourbot gallery:...'        -> every card in the game
+    - '@yourbot <anything else>'    -> character search (name / rarity / event,
+      combine with '|'); no '@yourbot' text at all -> every card in the game
+    Returns a scrollable native Telegram photo gallery - nothing gets posted in
+    the chat itself unless the person taps a specific photo to send it.
     """
-    query_text = update.inline_query.query or ""
+    query_text = (update.inline_query.query or "").strip()
 
+    owner_id = None
+    counts = {}
     if query_text.startswith("constellation:"):
         try:
             owner_id = int(query_text.split(":", 1)[1])
         except ValueError:
             owner_id = update.inline_query.from_user.id
-        items = db.get_user_inventory(owner_id)
-    elif query_text.startswith("search:"):
-        search_term = query_text.split(":", 1)[1]
-        items = db.search_characters(search_term)
-    elif query_text.startswith("gallery:"):
+        all_copies = db.get_user_inventory(owner_id, apply_filter=False)
+        items = []
+        for item in all_copies:
+            if item["id"] not in counts:
+                items.append(item)
+            counts[item["id"]] = counts.get(item["id"], 0) + 1
+    elif query_text.startswith("gallery:") or not query_text:
+        # No extra text (just opening the inline keyboard) - show the full game
+        # gallery, not only the cards this person happens to own.
         items = db.get_all_characters()
     else:
-        # Someone typed the bot's @username with no extra query text (just
-        # opening the inline keyboard) - show the full game gallery, not
-        # only the cards this person happens to own.
-        items = db.get_all_characters()
+        if query_text.lower().startswith("search:"):  # old "View search results" buttons
+            query_text = query_text.split(":", 1)[1].strip()
+        items = db.search_characters(query_text)
 
     offset = update.inline_query.offset
     start = int(offset) if offset else 0
     chunk = items[start:start + CONSTELLATION_PAGE_SIZE]
+
+    owner_name = db.get_display_name(owner_id) if owner_id is not None else None
 
     results = []
     for i, item in enumerate(chunk):
         if not item["image_file_id"]:
             continue
         result_id = f"{item['id']}_{start + i}"
-        caption = build_inline_share_caption(item)
+        if owner_id is not None:
+            caption = build_inline_collection_caption(
+                item, owner_id, owner_name, counts.get(item["id"], 1)
+            )
+        else:
+            caption = build_inline_share_caption(item)
         if item["media_type"] == "video":
             results.append(InlineQueryResultCachedVideo(
                 id=result_id,
@@ -3653,6 +3699,21 @@ def build_inline_share_caption(character) -> str:
     return "\n".join(lines)
 
 
+def build_inline_collection_caption(character, owner_id: int, owner_name: str, copies: int) -> str:
+    """Caption under a card sent from a player's inline collection gallery."""
+    lines = [
+        f"୨୧ {_mention(owner_id, owner_name)} 𝐂𝐀𝐑𝐃 𝐈𝐒 𝐇𝐄𝐑𝐄! ୨୧",
+        "",
+        html.escape(character["series"] or ""),
+        f"𝐈𝐃 𖧷 {character['id']} : {html.escape(character['name'])}" + (f" x{copies}" if copies > 1 else ""),
+    ]
+    if character["event_name"]:
+        lines.append(f"𝐄𝐕𝐄𝐍𝐓 › {html.escape(character['event_name'])}")
+    rarity_text = character["rarity_name"] if character["rarity_name"] else "Unranked"
+    lines.append(f"𝐑𝐀𝐑𝐈𝐓𝐘 › {html.escape(rarity_text)}")
+    return "\n".join(lines)
+
+
 def build_card_caption(character, owners_count: int) -> str:
     rarity_text = character["rarity_name"] if character["rarity_name"] else "Unranked"
 
@@ -3683,15 +3744,16 @@ def build_card_caption(character, owners_count: int) -> str:
         lines.append(f"✦ 🛡 𝐹𝑖𝑔ℎ𝑡𝑒𝑟: {elem.get('label', fighter['element'])}")
         lines.append(f"✦ 𝐵𝑎𝑠𝑒 𝐴𝑇𝐾: {fighter['base_attack']}  |  𝐵𝑎𝑠𝑒 𝐷𝐸𝐹: {fighter['base_defense']}")
 
-    owner_names = db.get_random_owner_names(character["id"], 5)
+    owner_ids = db.get_random_owner_ids(character["id"], 5)
     lines += [
         "",
         "──────── ✦ ────────",
         "",
         f"🌠 𝐶la𝐢𝐦𝐞𝐝 𝛃𝛶 {owners_count} 𝛫𝐞𝐞𝛒ers",
     ]
-    if owner_names:
-        lines.append(", ".join(owner_names))
+    for uid in owner_ids:
+        # account name as a link that opens the person's profile (not the @username)
+        lines.append(f"▸ {_mention(uid, format_display_name(uid, db.get_display_name(uid)))}")
     return "\n".join(lines)
 
 

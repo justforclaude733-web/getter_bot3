@@ -1321,6 +1321,29 @@ def get_random_owner_names(character_id: int, limit: int = 5):
     return names
 
 
+def get_random_owner_ids(character_id: int, limit: int = 5):
+    """Up to `limit` distinct owners (user ids) of this character, picked at random."""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT DISTINCT user_id FROM user_characters WHERE character_id = ?", (character_id,))
+    owner_ids = [row["user_id"] for row in cur.fetchall()]
+    conn.close()
+    return random.sample(owner_ids, min(limit, len(owner_ids)))
+
+
+def count_user_copies(user_id: int, character_id: int) -> int:
+    """How many copies of this exact card the player owns right now."""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT COUNT(*) AS c FROM user_characters WHERE user_id = ? AND character_id = ?",
+        (user_id, character_id),
+    )
+    row = cur.fetchone()
+    conn.close()
+    return row["c"]
+
+
 def _init_fighter_fields_if_applicable(cur, user_character_id: int, character_id: int):
     """
     If character_id is a registered Fighter, stamps the freshly-inserted
