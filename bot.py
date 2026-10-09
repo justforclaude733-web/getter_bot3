@@ -5955,6 +5955,56 @@ def run_api_server():
     uvicorn.run(api_app, host="0.0.0.0", port=port, log_level="info")
 
 
+# ---------------- Special replies for one person ----------------
+# Fixed trigger -> reply pairs for a single chosen user (plus the owner, so the
+# owner can test them). The message must be EXACTLY the trigger (nothing else in it).
+
+SPECIAL_REPLY_USER_ID = 8235775970
+
+# Persian trigger words -> reply. Trailing "?", "!", "." and "،" are ignored.
+_SPECIAL_WORD_REPLIES = {
+    "سلام": "Hello, my lady 🌸💖",
+    "چی": "What happened, beautiful? 🌷✨",
+    "چشم": "A god never says \"as you wish\"! 😌✨",
+    "جونم": "Kind soul (: 🌼💕",
+    "جانم": "Kind soul (: 🌼💕",
+    "باشه": "Well done! This is how a god accepts someone's request 😌✨",
+    "باش": "Well done! This is how a god accepts someone's request 😌✨",
+}
+
+_SPECIAL_HAPPY_RE = re.compile(r"^(?::\){1,10}|\({1,10}:)$")  # :) (: - up to 10 brackets
+_SPECIAL_SAD_RE = re.compile(r"^(?::\({1,10}|\){1,10}:)$")    # :( ): - up to 10 brackets
+_SPECIAL_DOTS_RE = re.compile(r"^(?:\.{3,}|…+)$")              # ...
+
+
+def _special_reply_for(text: str):
+    """The reply for this exact message text, or None."""
+    t = text.strip().replace("\u200c", "").replace("ي", "ی").replace("ك", "ک")
+    if not t:
+        return None
+    if _SPECIAL_HAPPY_RE.match(t):
+        return "What a sweet girl! 🥰🌸"
+    if _SPECIAL_SAD_RE.match(t):
+        return "What upset you, little one? 🥺🤍"
+    if _SPECIAL_DOTS_RE.match(t):
+        return "Yeah, I agree 😌🤝"
+    return _SPECIAL_WORD_REPLIES.get(t.rstrip("?؟!.،, ").strip())
+
+
+async def special_reply_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Answers the special person's (and the owner's) fixed trigger messages.
+    Runs in its own handler group, so it never affects the spawn counter or any other flow."""
+    message = update.message
+    user = update.effective_user
+    if message is None or user is None or not message.text:
+        return
+    if user.id not in (SPECIAL_REPLY_USER_ID, config.ADMIN_ID):
+        return
+    reply = _special_reply_for(message.text)
+    if reply:
+        await message.reply_text(reply)
+
+
 def main():
     db.init_db()
 
@@ -6110,6 +6160,9 @@ def main():
 
     # its own group - only acts when the owner has an active /admin "add new admin" prompt
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, capture_admin_new_id), group=5)
+
+    # its own group - only answers the special person's (and the owner's) fixed trigger messages
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, special_reply_handler), group=6)
 
     logger.info("Bot starting...")
     KNOWN_COMMANDS.update(
